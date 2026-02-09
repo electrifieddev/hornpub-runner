@@ -104,7 +104,8 @@ export class KlineManager {
       for (const sym of symbols) {
         const key: SeriesKey = { exchange: this.opts.exchange, symbol: sym, interval: this.opts.interval };
         try {
-          await this.opts.store.trimBefore(key, now - this.opts.historyDays * 24 * 60 * 60 * 1000);
+          // Keep cache bounded: drop candles older than our history window
+          await this.opts.store.trimOld(key, now - this.opts.historyDays * 24 * 60 * 60 * 1000);
         } catch (e) {
           this.log(`trim error for ${sym}`, e);
         }

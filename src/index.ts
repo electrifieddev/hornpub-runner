@@ -188,10 +188,12 @@ async function main() {
     store: klineStore,
     exchange: "binance",
     interval: "1m",
-    retentionDays: Number(process.env.KLINE_RETENTION_DAYS ?? 30),
-    refreshEveryMs: Number(process.env.KLINE_REFRESH_EVERY_MS ?? 60_000),
-    maxConcurrentFetches: Number(process.env.KLINE_MAX_CONCURRENCY ?? 3),
-    activeSymbolsProvider: async () => {
+	    // Keep a bounded amount of history in the global cache
+	    historyDays: Number(process.env.KLINE_RETENTION_DAYS ?? 30),
+	    // How often the manager refreshes active symbols & fetches new klines
+	    pollEverySeconds: Math.max(10, Math.floor(Number(process.env.KLINE_REFRESH_EVERY_MS ?? 60_000) / 1000)),
+	    maxConcurrency: Number(process.env.KLINE_MAX_CONCURRENCY ?? 3),
+	    getActiveSymbols: async () => {
       const statuses = (process.env.ACTIVE_PROJECT_STATUSES ?? "live,running").split(",").map((s) => s.trim()).filter(Boolean);
       const { data, error } = await supabase
         .from("projects")
@@ -204,7 +206,7 @@ async function main() {
       }
       return syms;
     },
-    onLog: (msg) => console.log(`[KLINES] ${msg}`),
+	    onLog: (msg: string) => console.log(`[KLINES] ${msg}`),
   });
   klineManager.start();
   while (true) {
