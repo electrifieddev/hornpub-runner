@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
-import { KlineManager } from "./klines/KlineManager";
-import { SupabaseKlineStore } from "./klines/SupabaseKlineStore";
+import { KlineManager } from "./klines/KlineManager.js";
+import { SupabaseKlineStore } from "./klines/SupabaseKlineStore.js";
 import vm from "node:vm";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -206,7 +206,7 @@ async function main() {
       }
       return syms;
     },
-	    onLog: (msg: string) => console.log(`[KLINES] ${msg}`),
+	    logger: (msg: string) => console.log(`[KLINES] ${msg}`),
   });
   klineManager.start();
   while (true) {

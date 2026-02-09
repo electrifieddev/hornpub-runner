@@ -1,6 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { Kline } from "./types";
-import { KlineStore, SeriesKey } from "./store";
+import { Kline } from "./types.js";
+import { KlineStore, SeriesKey } from "./store.js";
 
 /**
  * Persists klines into Postgres.

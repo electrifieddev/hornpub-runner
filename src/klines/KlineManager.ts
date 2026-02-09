@@ -1,6 +1,6 @@
-import { fetchBinanceKlines } from "./binance";
-import { Kline, KlineInterval } from "./types";
-import { KlineStore, SeriesKey } from "./store";
+import { fetchBinanceKlines } from "./binance.js";
+import { Kline, KlineInterval } from "./types.js";
+import { KlineStore, SeriesKey } from "./store.js";
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));

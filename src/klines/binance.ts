@@ -1,4 +1,4 @@
-import { Kline, KlineInterval } from "./types";
+import { Kline, KlineInterval } from "./types.js";
 
 const BINANCE_BASE = "https://api.binance.com";
 

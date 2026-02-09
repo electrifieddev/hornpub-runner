@@ -1,4 +1,4 @@
-import { Exchange, Kline, KlineInterval } from "./types";
+import { Exchange, Kline, KlineInterval } from "./types.js";
 
 export type SeriesKey = { exchange: Exchange; symbol: string; interval: KlineInterval };
 
