@@ -20,6 +20,9 @@ export type KlineManagerOpts = {
   maxConcurrency: number; // e.g. 3
   store: KlineStore;
   getActiveSymbols: ActiveSymbolsProvider;
+  /** Legacy log hook (string only). */
+  onLog?: (msg: string) => void;
+  /** Preferred log hook (supports extra object). */
   logger?: (msg: string, extra?: any) => void;
 };
 
@@ -61,6 +64,7 @@ export class KlineManager {
 
   private log(msg: string, extra?: any) {
     if (this.opts.logger) return this.opts.logger(msg, extra);
+    if (this.opts.onLog) return this.opts.onLog(extra ? `${msg} ${safeJson(extra)}` : msg);
     if (extra) console.log(`[KlineManager] ${msg}`, extra);
     else console.log(`[KlineManager] ${msg}`);
   }
