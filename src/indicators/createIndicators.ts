@@ -13,7 +13,18 @@ function getCloses(cache: KlineCache, ctx: IndicatorContext, tf: string): number
   return series?.closes ?? [];
 }
 
-export function createIndicators(cache: KlineCache, ctx: IndicatorContext) {
+// Accept both call styles to keep integration flexible:
+//   createIndicators(cache, ctx)
+//   createIndicators({ cache, ctx })
+export function createIndicators(cache: KlineCache, ctx: IndicatorContext): ReturnType<typeof _createIndicators>;
+export function createIndicators(opts: { cache: KlineCache; ctx: IndicatorContext }): ReturnType<typeof _createIndicators>;
+export function createIndicators(arg1: KlineCache | { cache: KlineCache; ctx: IndicatorContext }, arg2?: IndicatorContext) {
+  const cache = (arg1 as any)?.cache ? (arg1 as any).cache : (arg1 as KlineCache);
+  const ctx = (arg1 as any)?.ctx ? (arg1 as any).ctx : (arg2 as IndicatorContext);
+  return _createIndicators(cache, ctx);
+}
+
+function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
   return {
     RSI: (p: RSIParams): number => {
       const closes = getCloses(cache, ctx, p.tf);

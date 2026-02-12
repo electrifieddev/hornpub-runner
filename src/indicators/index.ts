@@ -41,7 +41,7 @@ export function makeIndicators(cache: KlineCache, ctx: IndicatorContext) {
     },
     MACD_CROSS_UP: (params: MacdCrossParams): boolean => {
       const closes = getCloses(cache, ctx, params.tf);
-      const { macdLine, signalLine } = macd(closes, params.fast, params.slow, params.signal);
+      const { macd: macdLine, signal: signalLine } = macd(closes, params.fast, params.slow, params.signal);
       if (macdLine.length < 2 || signalLine.length < 2) return false;
       const i = macdLine.length - 1;
       const prev = macdLine[i - 1] - signalLine[i - 1];

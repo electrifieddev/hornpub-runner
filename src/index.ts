@@ -141,7 +141,7 @@ async function runProject(p: Project) {
       if (!preloadOk) continue;
 
       const context = { exchange: "binance", symbol };
-      const indicators = createIndicators({ cache: klineCache, ctx: context });
+      const indicators = createIndicators(klineCache, context);
 
       const broker = new PaperBroker({
         supabase,
