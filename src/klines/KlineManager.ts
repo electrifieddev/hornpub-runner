@@ -10,6 +10,14 @@ function uniq<T>(arr: T[]): T[] {
   return Array.from(new Set(arr));
 }
 
+function safeJson(v: unknown): string {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return "[unserializable]";
+  }
+}
+
 export type ActiveSymbolsProvider = () => Promise<string[]>;
 
 export type KlineManagerOpts = {
@@ -38,6 +46,11 @@ export class KlineManager {
   private stopped = false;
   private inFlight = new Set<string>();
   private lastTrimAt = 0;
+
+  // Symbols that repeatedly fail (invalid, delisted, etc.) are temporarily skipped
+  // so they can't poison the whole tick loop.
+  private invalidUntil = new Map<string, number>();
+  private invalidBackoffMs = new Map<string, number>();
 
   constructor(opts: KlineManagerOpts) {
     this.opts = opts;
@@ -75,7 +88,25 @@ export class KlineManager {
 
   private async syncSymbols(symbols: string[]) {
     const { maxConcurrency } = this.opts;
-    const queue = [...symbols];
+
+    // Drop bad symbols and temporarily-invalid symbols so one user typo can't
+    // keep spamming errors forever.
+    const nowMs = Date.now();
+    const queue = symbols
+      .map((s) => (s || "").toUpperCase().trim())
+      .filter(Boolean)
+      .filter((s) => {
+        const until = this.invalidUntil.get(s);
+        return !until || until <= nowMs;
+      })
+      .filter((s) => {
+        // Binance spot symbols are uppercase alphanum. Most of your current scope is USDT.
+        // We don't hard-restrict future quote assets, but we reject obviously invalid strings.
+        return /^[A-Z0-9]{3,30}$/.test(s);
+      });
+    // We'll mutate `queue` while workers consume it. Keep a snapshot for trimming.
+    const trimList = [...queue];
+
     const workers: Promise<void>[] = [];
 
     for (let i = 0; i < maxConcurrency; i++) {
@@ -105,7 +136,7 @@ export class KlineManager {
     const now = Date.now();
     if (now - this.lastTrimAt > 60 * 60 * 1000) {
       this.lastTrimAt = now;
-      for (const sym of symbols) {
+      for (const sym of trimList) {
         const key: SeriesKey = { exchange: this.opts.exchange, symbol: sym, interval: this.opts.interval };
         try {
           // Keep cache bounded: drop candles older than our history window
@@ -118,32 +149,53 @@ export class KlineManager {
   }
 
   private async syncOne(symbol: string) {
-    const key: SeriesKey = { exchange: this.opts.exchange, symbol, interval: this.opts.interval };
+    try {
+      const key: SeriesKey = { exchange: this.opts.exchange, symbol, interval: this.opts.interval };
 
-    const latest = await this.opts.store.getLatestOpenTime(key);
-    const now = Date.now();
-    const historyMs = this.opts.historyDays * 24 * 60 * 60 * 1000;
+      const latest = await this.opts.store.getLatestOpenTime(key);
+      const now = Date.now();
+      const historyMs = this.opts.historyDays * 24 * 60 * 60 * 1000;
 
-    // If we have nothing, bootstrap last N days.
-    if (!latest) {
-      this.log(`bootstrap ${symbol} (${this.opts.historyDays}d)`);
-      await this.bootstrapHistory(symbol, now - historyMs, now);
-      return;
+      // If we have nothing, bootstrap last N days.
+      if (!latest) {
+        this.log(`bootstrap ${symbol} (${this.opts.historyDays}d)`);
+        await this.bootstrapHistory(symbol, now - historyMs, now);
+        // If bootstrap worked once, clear invalid backoff.
+        this.invalidUntil.delete(symbol);
+        this.invalidBackoffMs.delete(symbol);
+        return;
+      }
+
+      // Fetch only the tail since latest candle (plus 1 interval).
+      // Binance returns candles with open_time >= startTime.
+      const startTime = latest + this.intervalMs(this.opts.interval);
+      if (startTime > now - this.intervalMs(this.opts.interval)) {
+        return;
+      }
+
+      const fetched = await this.fetchPaged(symbol, startTime, now);
+      if (!fetched.length) {
+        this.invalidUntil.delete(symbol);
+        this.invalidBackoffMs.delete(symbol);
+        return;
+      }
+
+      await this.opts.store.upsertMany(fetched);
+      this.log(`synced ${symbol}: +${fetched.length} klines`);
+
+      this.invalidUntil.delete(symbol);
+      this.invalidBackoffMs.delete(symbol);
+    } catch (err: any) {
+      // Mark invalid with backoff and keep the rest of the loop healthy.
+      const prev = this.invalidBackoffMs.get(symbol) ?? 5 * 60 * 1000; // 5m
+      const next = Math.min(prev * 2, 6 * 60 * 60 * 1000); // cap 6h
+      this.invalidBackoffMs.set(symbol, next);
+      const until = Date.now() + next;
+      this.invalidUntil.set(symbol, until);
+
+      const msg = err?.message ? String(err.message) : JSON.stringify(err);
+      this.log(`skip ${symbol}: ${msg} (retry in ${Math.round(next / 60000)}m)`);
     }
-
-    // Fetch only the tail since latest candle (plus 1 interval).
-    // Binance returns candles with open_time >= startTime.
-    const startTime = latest + this.intervalMs(this.opts.interval);
-    if (startTime > now - this.intervalMs(this.opts.interval)) {
-      // We are up to date.
-      return;
-    }
-
-    const fetched = await this.fetchPaged(symbol, startTime, now);
-    if (!fetched.length) return;
-
-    await this.opts.store.upsertMany(fetched);
-    this.log(`synced ${symbol}: +${fetched.length} klines`);
   }
 
   private async bootstrapHistory(symbol: string, startTime: number, endTime: number) {

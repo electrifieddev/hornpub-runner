@@ -1,7 +1,10 @@
 import { createClient } from "@supabase/supabase-js";
 import { KlineManager } from "./klines/KlineManager.js";
 import { SupabaseKlineStore } from "./klines/SupabaseKlineStore.js";
-import vm from "node:vm";
+import { KlineCache } from "./klines/KlineCache.js";
+import createIndicators from "./indicators/createIndicators.js";
+import { runInSandbox } from "./engine/Sandbox.js";
+import { PaperBroker } from "./broker/PaperBroker.js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -12,6 +15,20 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
+
+// Global in-memory kline cache used by synchronous indicators.
+// IMPORTANT: indicators must not hit the DB at runtime; preload happens before each symbol execution.
+const klineCache = new KlineCache({ supabase, table: "market_klines" });
+
+function extractTimeframesFromCode(code: string): string[] {
+  // Very small heuristic: find tf: "1m" in object-literal params.
+  const out = new Set<string>();
+  const re = /\btf\s*:\s*["']([^"']+)["']/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code))) out.add(m[1]);
+  if (out.size === 0) out.add("1m");
+  return [...out];
+}
 
 type Project = {
   id: string;
@@ -96,34 +113,71 @@ async function runProject(p: Project) {
 
     await log(p.id, p.owner_id, "info", "Run started.");
 
-    // Expose a tiny API to strategy code
-    const HP = {
-      buy: async (symbol: string, usd: number) => {
-        if (await hasOpenPosition(p.id, symbol)) {
-          await log(p.id, p.owner_id, "info", `BUY blocked: already open for ${symbol}`);
-          return;
-        }
-        await openPosition(p.id, p.owner_id, symbol, usd);
-        await log(p.id, p.owner_id, "info", `BUY executed: ${symbol} $${usd}`);
-      },
-      sell: async (symbol: string) => {
-        if (!(await hasOpenPosition(p.id, symbol))) {
-          await log(p.id, p.owner_id, "info", `SELL blocked: no open position for ${symbol}`);
-          return;
-        }
-        await closePosition(p.id, symbol);
-        await log(p.id, p.owner_id, "info", `SELL executed: ${symbol}`);
-      },
-      log: async (msg: string) => log(p.id, p.owner_id, "info", msg),
-    };
+    // Load symbols from projects table (claim_due_projects doesn't guarantee returning them)
+    const { data: projRow, error: projErr } = await supabase
+      .from("projects")
+      .select("symbols")
+      .eq("id", p.id)
+      .single();
+    if (projErr) throw projErr;
+    const symbols = (projRow?.symbols ?? []) as string[];
 
-    // Run in VM context
-    // NOTE: for now this is “trusted code”. Later we sandbox harder.
-    const context = vm.createContext({ HP });
-    const wrapped = `(async () => { ${p.generated_js}\n })()`;
-    const script = new vm.Script(wrapped);
+    const timeframes = extractTimeframesFromCode(p.generated_js) ?? ["1m"];
 
-    await script.runInContext(context, { timeout: 5000 });
+    for (const symbol of symbols) {
+      // Preload the cache for all required timeframes *before* executing the strategy.
+      // If a symbol is invalid or has no data, skip it but keep the run alive.
+      let preloadOk = true;
+      for (const tf of timeframes) {
+        try {
+          await klineCache.preload("binance", symbol, tf, {
+            maxCandles: Number(process.env.INDICATOR_MAX_CANDLES ?? 5000),
+          });
+        } catch (e: any) {
+          preloadOk = false;
+          await log(p.id, p.owner_id, "warn", `Klines unavailable for ${symbol} ${tf}: ${e?.message ?? String(e)}`);
+        }
+      }
+      if (!preloadOk) continue;
+
+      const context = { exchange: "binance", symbol };
+      const indicators = createIndicators({ cache: klineCache, ctx: context });
+
+      const broker = new PaperBroker(supabase, klineCache, {
+        userId: p.owner_id,
+        projectId: p.id,
+        runId,
+        symbol,
+        exchange: "binance",
+        // Used only to get a "latest price" for sizing/PNL. Defaults to 1m.
+        tf: "1m",
+      });
+
+      // Broker surface exposed to user strategies.
+      // Supports BOTH:
+      //   await HP.buy({ usd: 100 })
+      //   await HP.buy("BTCUSDT", 100)   (legacy)
+      //   await HP.sell({ pct: 100 })
+      //   await HP.sell("BTCUSDT", 100)  (legacy pct)
+      const HP = {
+        buy: async (a: any, b?: any) => {
+          const usd = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.usd ?? 0);
+          // ignore symbol argument (engine runs per symbol)
+          await broker.buy({ usd });
+        },
+        sell: async (a: any, b?: any) => {
+          const pct = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.pct ?? 100);
+          await broker.sell({ pct });
+        },
+        log: async (msg: string) => broker.log("info", String(msg)),
+      };
+
+      await runInSandbox(p.generated_js, {
+        ...indicators,
+        HP,
+        context,
+      }, { timeoutMs: 5000 });
+    }
 
     await log(p.id, p.owner_id, "info", "Run finished OK.");
 
@@ -132,7 +186,6 @@ async function runProject(p: Project) {
       .update({
         status: "ok",
         finished_at: new Date().toISOString(),
-        summary: "OK",
       })
       .eq("id", runId);
 
