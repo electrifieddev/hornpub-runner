@@ -141,16 +141,20 @@ async function runProject(p: Project) {
       if (!preloadOk) continue;
 
       const context = { exchange: "binance", symbol };
-      const indicators = createIndicators(klineCache, context);
+      const indicators = createIndicators({ cache: klineCache, ctx: context });
 
-      const broker = new PaperBroker(supabase, klineCache, {
-        userId: p.owner_id,
-        projectId: p.id,
-        runId,
-        symbol,
-        exchange: "binance",
-        // Used only to get a "latest price" for sizing/PNL. Defaults to 1m.
-        tf: "1m",
+      const broker = new PaperBroker({
+        supabase,
+        cache: klineCache,
+        ctx: {
+          userId: p.owner_id,
+          projectId: p.id,
+          runId,
+          symbol,
+          exchange: "binance",
+          // Used only to get a "latest price" for sizing/PNL. Defaults to 1m.
+          tf: "1m",
+        },
       });
 
       // Broker surface exposed to user strategies.
