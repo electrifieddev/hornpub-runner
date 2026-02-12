@@ -38,8 +38,16 @@ export class KlineCache {
    * Preload candles into memory so indicator functions can be synchronous.
    * Loads up to `maxCandles` most recent candles, ordered oldest->newest.
    */
-  async preload(exchange: string, symbol: string, interval: string): Promise<KlineSeries | null> {
+  async preload(
+    exchange: string,
+    symbol: string,
+    interval: string,
+    opts?: { maxCandles?: number }
+  ): Promise<KlineSeries | null> {
     const key = keyOf(exchange, symbol, interval);
+
+    // Allow callers to request a smaller in-memory series size.
+    const limit = Math.max(50, Math.min(this.maxCandles, opts?.maxCandles ?? this.maxCandles));
 
     const { data, error } = await this.supabase
       .from(this.table)
@@ -48,7 +56,7 @@ export class KlineCache {
       .eq("symbol", symbol)
       .eq("interval", interval)
       .order("open_time", { ascending: false })
-      .limit(this.maxCandles);
+      .limit(limit);
 
     if (error) throw error;
     if (!data || data.length === 0) {

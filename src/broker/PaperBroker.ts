@@ -28,14 +28,15 @@ export class PaperBroker {
 
   /** Latest close for pricing. Returns null if we don't have candles yet. */
   private getMarkPrice(): number | null {
-    const closes = this.cache.getCloses(this.ctx.symbol, this.ctx.tf);
+    const closes = this.cache.getCloses(this.ctx.exchange, this.ctx.symbol, this.ctx.tf);
     if (!closes || closes.length === 0) return null;
     const v = closes[closes.length - 1];
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
   }
 
-  private async log(level: LogLevel, message: string, meta: Record<string, any> = {}) {
+  // Intentionally public so sandbox-exposed HP.log can forward to it.
+  async log(level: LogLevel, message: string, meta: Record<string, any> = {}) {
     // Keep schema-flexible: put details in meta_json.
     await this.sb.from("project_logs").insert({
       user_id: this.ctx.userId,

@@ -49,6 +49,60 @@ export function ema(values: number[], period: number): number[] {
   return out;
 }
 
+/**
+ * Relative Strength Index (RSI) using Wilder's smoothing.
+ * Returns an array aligned with input (first period values are NaN).
+ */
+/**
+ * Relative Strength Index (RSI) using Wilder's smoothing.
+ * Returns ONLY the latest RSI value.
+ */
+export function rsi(values: number[], period: number): number {
+  const n = Math.max(1, Math.floor(period));
+  if (values.length < n + 1) return Number.NaN;
+
+  let gain = 0;
+  let loss = 0;
+  for (let i = 1; i <= n; i++) {
+    const diff = values[i] - values[i - 1];
+    if (diff >= 0) gain += diff;
+    else loss -= diff;
+  }
+
+  let avgGain = gain / n;
+  let avgLoss = loss / n;
+
+  const rs0 = avgLoss === 0 ? Infinity : avgGain / avgLoss;
+  let lastRsi = 100 - 100 / (1 + rs0);
+
+  for (let i = n + 1; i < values.length; i++) {
+    const diff = values[i] - values[i - 1];
+    const g = diff > 0 ? diff : 0;
+    const l = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (n - 1) + g) / n;
+    avgLoss = (avgLoss * (n - 1) + l) / n;
+    const rs = avgLoss === 0 ? Infinity : avgGain / avgLoss;
+    lastRsi = 100 - 100 / (1 + rs);
+  }
+  return lastRsi;
+}
+
+/** Returns true if seriesA crosses above seriesB on the most recent candle. */
+export function crossUp(seriesA: number[], seriesB: number[]): boolean {
+  const a = last2Defined(seriesA);
+  const b = last2Defined(seriesB);
+  if (!a || !b) return false;
+  return a[0] <= b[0] && a[1] > b[1];
+}
+
+export function macd(values: number[], fast = 12, slow = 26, signal = 9): { macd: number[]; signal: number[] } {
+  const fastEma = ema(values, fast);
+  const slowEma = ema(values, slow);
+  const macdLine = values.map((_, i) => fastEma[i] - slowEma[i]);
+  const signalLine = ema(macdLine, signal);
+  return { macd: macdLine, signal: signalLine };
+}
+
 export function last2Defined(series: number[]): [number, number] | null {
   for (let i = series.length - 1; i >= 1; i--) {
     const a = series[i - 1];
