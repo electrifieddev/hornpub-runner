@@ -37,12 +37,19 @@ type Project = {
   interval_seconds: number;
 };
 
-async function log(projectId: string, ownerId: string, level: string, message: string) {
+async function log(
+  projectId: string,
+  ownerId: string,
+  level: string,
+  message: string,
+  meta: Record<string, any> = {}
+) {
   const { error } = await supabase.from("project_logs").insert({
     project_id: projectId,
     user_id: ownerId, // project_logs expects user_id
     level,
     message,
+    meta,
   });
   if (error) {
     // Don't crash the whole runner just because logging failed.
@@ -111,7 +118,7 @@ async function runProject(p: Project) {
       return;
     }
 
-    await log(p.id, p.owner_id, "info", "Run started.");
+    await log(p.id, p.owner_id, "info", "Run started.", { run_id: runId });
 
     // Load symbols from projects table (claim_due_projects doesn't guarantee returning them)
     const { data: projRow, error: projErr } = await supabase
@@ -135,7 +142,9 @@ async function runProject(p: Project) {
           });
         } catch (e: any) {
           preloadOk = false;
-          await log(p.id, p.owner_id, "warn", `Klines unavailable for ${symbol} ${tf}: ${e?.message ?? String(e)}`);
+          await log(p.id, p.owner_id, "warn", `Klines unavailable for ${symbol} ${tf}: ${e?.message ?? String(e)}`,
+            { run_id: runId, symbol, tf, exchange: "binance" }
+          );
         }
       }
       if (!preloadOk) continue;
@@ -176,14 +185,26 @@ async function runProject(p: Project) {
         log: async (msg: string) => broker.log("info", String(msg)),
       };
 
-      await runInSandbox(p.generated_js, {
-        ...indicators,
-        HP,
-        context,
-      }, { timeoutMs: 5000 });
+      try {
+        await runInSandbox(
+          p.generated_js,
+          {
+            ...indicators,
+            HP,
+            context,
+          },
+          { timeoutMs: 5000 }
+        );
+      } catch (e: any) {
+        // High-signal per-symbol failure without spamming every tick.
+        await log(p.id, p.owner_id, "error", `Strategy error for ${symbol}: ${e?.message ?? String(e)}`,
+          { run_id: runId, symbol, exchange: "binance" }
+        );
+        throw e;
+      }
     }
 
-    await log(p.id, p.owner_id, "info", "Run finished OK.");
+    await log(p.id, p.owner_id, "info", "Run finished OK.", { run_id: runId });
 
     await supabase
       .from("project_runs")
@@ -202,7 +223,9 @@ async function runProject(p: Project) {
       .eq("id", p.id);
   } catch (e: any) {
     const msg = e?.message ?? String(e);
-    await log(p.id, p.owner_id, "error", `Run failed: ${msg}`);
+    await log(p.id, p.owner_id, "error", `Run failed: ${msg}`,
+      { run_id: runId }
+    );
 
     await supabase
       .from("project_runs")

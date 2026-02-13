@@ -37,13 +37,13 @@ export class PaperBroker {
 
   // Intentionally public so sandbox-exposed HP.log can forward to it.
   async log(level: LogLevel, message: string, meta: Record<string, any> = {}) {
-    // Keep schema-flexible: put details in meta_json.
+    // Keep schema-flexible: put details in meta (jsonb).
     await this.sb.from("project_logs").insert({
       user_id: this.ctx.userId,
       project_id: this.ctx.projectId,
       level,
       message,
-      meta_json: { ...meta, run_id: this.ctx.runId, symbol: this.ctx.symbol, exchange: this.ctx.exchange },
+      meta: { ...meta, run_id: this.ctx.runId, symbol: this.ctx.symbol, exchange: this.ctx.exchange },
     });
   }
 
@@ -51,7 +51,6 @@ export class PaperBroker {
     const { data, error } = await this.sb
       .from("project_positions")
       .select("*")
-      .eq("user_id", this.ctx.userId)
       .eq("project_id", this.ctx.projectId)
       .eq("symbol", this.ctx.symbol)
       .eq("status", "open")
@@ -99,7 +98,17 @@ export class PaperBroker {
       exit_time: null,
       realized_pnl: null,
     });
-    if (error) throw error;
+    if (error) {
+      // If multiple runners / concurrent BUY calls happen, DB uniqueness is the final guard.
+      // Treat "already open" as a no-op instead of failing the whole run.
+      // Postgres unique violation: 23505
+      const anyErr: any = error;
+      if (anyErr?.code === "23505") {
+        await this.log("info", "BUY skipped: position already open (db constraint)", { usd, price, qty });
+        return;
+      }
+      throw error;
+    }
 
     await this.log("info", "BUY executed (paper)", { usd, price, qty });
   }
