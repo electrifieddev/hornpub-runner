@@ -47,6 +47,33 @@ export class PaperBroker {
     });
   }
 
+  private async insertTrade(args: {
+    side: "buy" | "sell";
+    qty: number;
+    price: number;
+    ts: string;
+    positionId?: string | null;
+    meta?: Record<string, any>;
+  }) {
+    // Trades/Fills history (append-only). Keep minimal and schema-aligned.
+    const { error } = await this.sb.from("project_trades").insert({
+      user_id: this.ctx.userId,
+      project_id: this.ctx.projectId,
+      run_id: this.ctx.runId,
+      symbol: this.ctx.symbol,
+      side: args.side,
+      qty: args.qty,
+      price: args.price,
+      ts: args.ts,
+      position_id: args.positionId ?? null,
+      meta: { ...(args.meta ?? {}), mode: "paper" },
+    });
+    // Never break trading/positions flow if trade-history insert fails.
+    if (error) {
+      await this.log("warn", "TRADE log failed", { side: args.side, qty: args.qty, price: args.price, error: String((error as any)?.message ?? error) });
+    }
+  }
+
   private async getOpenPosition() {
     const { data, error } = await this.sb
       .from("project_positions")
@@ -85,7 +112,9 @@ export class PaperBroker {
     const qty = usd / price;
     const now = new Date().toISOString();
 
-    const { error } = await this.sb.from("project_positions").insert({
+    const { data, error } = await this.sb
+      .from("project_positions")
+      .insert({
       user_id: this.ctx.userId,
       project_id: this.ctx.projectId,
       symbol: this.ctx.symbol,
@@ -97,7 +126,9 @@ export class PaperBroker {
       exit_price: null,
       exit_time: null,
       realized_pnl: null,
-    });
+    })
+      .select("id")
+      .maybeSingle();
     if (error) {
       // If multiple runners / concurrent BUY calls happen, DB uniqueness is the final guard.
       // Treat "already open" as a no-op instead of failing the whole run.
@@ -109,6 +140,15 @@ export class PaperBroker {
       }
       throw error;
     }
+
+    await this.insertTrade({
+      side: "buy",
+      qty,
+      price,
+      ts: now,
+      positionId: (data as any)?.id ?? null,
+      meta: { usd, reason: "strategy" },
+    });
 
     await this.log("info", "BUY executed (paper)", { usd, price, qty });
   }
@@ -162,6 +202,15 @@ export class PaperBroker {
         .eq("id", pos.id);
       if (error) throw error;
 
+      await this.insertTrade({
+        side: "sell",
+        qty: closeQty,
+        price,
+        ts: now,
+        positionId: pos.id,
+        meta: { pct, kind: "close", reason: "strategy" },
+      });
+
       await this.log("info", "SELL executed (paper, close)", {
         pct,
         price,
@@ -184,6 +233,15 @@ export class PaperBroker {
       })
       .eq("id", pos.id);
     if (error) throw error;
+
+    await this.insertTrade({
+      side: "sell",
+      qty: closeQty,
+      price,
+      ts: now,
+      positionId: pos.id,
+      meta: { pct, kind: "partial", reason: "strategy" },
+    });
 
     await this.log("info", "SELL executed (paper, partial)", {
       pct,
