@@ -51,6 +51,8 @@ export class PaperBroker {
     side: "buy" | "sell";
     qty: number;
     price: number;
+    realizedPnl?: number;
+    fee?: number;
     ts: string;
     positionId?: string | null;
     meta?: Record<string, any>;
@@ -64,13 +66,21 @@ export class PaperBroker {
       side: args.side,
       qty: args.qty,
       price: args.price,
+      fee: args.fee ?? 0,
       ts: args.ts,
       position_id: args.positionId ?? null,
+      realized_pnl: args.realizedPnl ?? 0,
       meta: { ...(args.meta ?? {}), mode: "paper" },
     });
     // Never break trading/positions flow if trade-history insert fails.
     if (error) {
-      await this.log("warn", "TRADE log failed", { side: args.side, qty: args.qty, price: args.price, error: String((error as any)?.message ?? error) });
+      await this.log("warn", "TRADE log failed", {
+        side: args.side,
+        qty: args.qty,
+        price: args.price,
+        realized_pnl: args.realizedPnl ?? 0,
+        error: String((error as any)?.message ?? error),
+      });
     }
   }
 
@@ -145,6 +155,8 @@ export class PaperBroker {
       side: "buy",
       qty,
       price,
+      realizedPnl: 0,
+      fee: 0,
       ts: now,
       positionId: (data as any)?.id ?? null,
       meta: { usd, reason: "strategy" },
@@ -166,7 +178,22 @@ export class PaperBroker {
 
     const pos = await this.getOpenPosition();
     if (!pos) {
-      await this.log("info", "SELL skipped: no open position", { pct });
+      // Per requirements: don't crash; record a trade row with realized_pnl=0 and warn.
+      const px = this.getMarkPrice();
+      const now = new Date().toISOString();
+      if (px) {
+        await this.insertTrade({
+          side: "sell",
+          qty: 0,
+          price: px,
+          realizedPnl: 0,
+          fee: 0,
+          ts: now,
+          positionId: null,
+          meta: { pct, kind: "no_position", reason: "strategy" },
+        });
+      }
+      await this.log("warn", "SELL skipped: no open position", { pct });
       return;
     }
 
@@ -206,6 +233,8 @@ export class PaperBroker {
         side: "sell",
         qty: closeQty,
         price,
+        realizedPnl: realized,
+        fee: 0,
         ts: now,
         positionId: pos.id,
         meta: { pct, kind: "close", reason: "strategy" },
@@ -238,6 +267,8 @@ export class PaperBroker {
       side: "sell",
       qty: closeQty,
       price,
+      realizedPnl: realized,
+      fee: 0,
       ts: now,
       positionId: pos.id,
       meta: { pct, kind: "partial", reason: "strategy" },
