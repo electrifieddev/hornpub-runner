@@ -7,7 +7,11 @@ export type KlineSeries = {
   symbol: string;
   interval: string;
   openTimes: number[];
+  opens: number[];
+  highs: number[];
+  lows: number[];
   closes: number[];
+  volumes: number[];
 };
 
 function keyOf(exchange: string, symbol: string, interval: string): CacheKey {
@@ -51,7 +55,8 @@ export class KlineCache {
 
     const { data, error } = await this.supabase
       .from(this.table)
-      .select("open_time, close")
+      // Load full OHLCV so indicators can resolve multiple `source` series.
+      .select("open_time, open, high, low, close, volume")
       .eq("exchange", exchange)
       .eq("symbol", symbol)
       .eq("interval", interval)
@@ -60,22 +65,30 @@ export class KlineCache {
 
     if (error) throw error;
     if (!data || data.length === 0) {
-      this.map.set(key, { exchange, symbol, interval, openTimes: [], closes: [] });
+      this.map.set(key, { exchange, symbol, interval, openTimes: [], opens: [], highs: [], lows: [], closes: [], volumes: [] });
       return this.map.get(key)!;
     }
 
     // We fetched DESC, reverse to ASC for indicator math.
     const rows = [...data].reverse();
     const openTimes: number[] = new Array(rows.length);
+    const opens: number[] = new Array(rows.length);
+    const highs: number[] = new Array(rows.length);
+    const lows: number[] = new Array(rows.length);
     const closes: number[] = new Array(rows.length);
+    const volumes: number[] = new Array(rows.length);
 
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i] as any;
       openTimes[i] = Number(r.open_time);
+      opens[i] = Number(r.open);
+      highs[i] = Number(r.high);
+      lows[i] = Number(r.low);
       closes[i] = Number(r.close);
+      volumes[i] = Number(r.volume);
     }
 
-    const series: KlineSeries = { exchange, symbol, interval, openTimes, closes };
+    const series: KlineSeries = { exchange, symbol, interval, openTimes, opens, highs, lows, closes, volumes };
     this.map.set(key, series);
     return series;
   }

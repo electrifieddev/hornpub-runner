@@ -20,6 +20,42 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 // IMPORTANT: indicators must not hit the DB at runtime; preload happens before each symbol execution.
 const klineCache = new KlineCache({ supabase, table: "market_klines" });
 
+// Cross detection requires prior values across ticks.
+// Keyed by project+symbol+callIndex to keep multiple CROSS_* calls stable per strategy.
+const crossPrev = new Map<string, { a: number; b: number }>();
+
+function safeNumber(v: any): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : Number.NaN;
+}
+
+async function getLastTradeTs(projectId: string, symbol: string): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("project_trades")
+    .select("ts")
+    .eq("project_id", projectId)
+    .eq("symbol", symbol)
+    .order("ts", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) return null;
+  return (data as any)?.ts ?? null;
+}
+
+function barsSinceTimestamp(exchange: string, symbol: string, tf: string, tsIso: string | null): number {
+  if (!tsIso) return Number.POSITIVE_INFINITY;
+  const tsMs = Date.parse(tsIso);
+  if (!Number.isFinite(tsMs)) return Number.POSITIVE_INFINITY;
+  const series = klineCache.getSeries(exchange, symbol, tf);
+  if (!series || series.openTimes.length === 0) return Number.POSITIVE_INFINITY;
+  const openTimes = series.openTimes;
+  // Find the first candle whose open_time >= ts.
+  let idx = 0;
+  while (idx < openTimes.length && openTimes[idx]! < tsMs) idx++;
+  const lastIdx = openTimes.length - 1;
+  return Math.max(0, lastIdx - Math.min(idx, lastIdx));
+}
+
 function extractTimeframesFromCode(code: string): string[] {
   // Very small heuristic: find tf: "1m" in object-literal params.
   const out = new Set<string>();
@@ -185,11 +221,70 @@ async function runProject(p: Project) {
         log: async (msg: string) => broker.log("info", String(msg)),
       };
 
+      // === New Blockly runtime surface (Checkpoint 4: events/cooldown/state) ===
+      // Snapshot position/trade state once per symbol execution (no per-call DB queries).
+      const { data: openPos } = await supabase
+        .from("project_positions")
+        .select("id, entry_time")
+        .eq("project_id", p.id)
+        .eq("symbol", symbol)
+        .eq("status", "open")
+        .maybeSingle();
+
+      const lastTradeTs = await getLastTradeTs(p.id, symbol);
+
+      // Cross detection uses a stable call index per execution.
+      let crossCallIdx = 0;
+
+      const IN_POSITION = () => Boolean(openPos?.id);
+
+      const BARS_SINCE_ENTRY = () => {
+        if (!openPos?.entry_time) return Number.POSITIVE_INFINITY;
+        return barsSinceTimestamp("binance", symbol, "1m", String(openPos.entry_time));
+      };
+
+      const COOLDOWN_OK = (p2: { bars: number; scope?: string }) => {
+        const bars = Math.max(0, Math.floor(Number((p2 as any)?.bars ?? 0)));
+        const scopeRaw = String((p2 as any)?.scope ?? "entry").toLowerCase();
+        // For now, only support entry-based cooldown (others safely fall back).
+        const scope = scopeRaw === "entry" ? "entry" : "entry";
+        void scope; // scope reserved for future expansion
+        const since = barsSinceTimestamp("binance", symbol, "1m", lastTradeTs);
+        return since >= bars;
+      };
+
+      const CROSS_UP = (a: any, b: any) => {
+        const currA = safeNumber((a as any)?.a ?? a);
+        const currB = safeNumber((a as any)?.b ?? b);
+        const idx = ++crossCallIdx;
+        const key = `${p.id}|${symbol}|up|${idx}`;
+        const prev = crossPrev.get(key);
+        crossPrev.set(key, { a: currA, b: currB });
+        if (!prev) return false;
+        return prev.a <= prev.b && currA > currB;
+      };
+
+      const CROSS_DOWN = (a: any, b: any) => {
+        const currA = safeNumber((a as any)?.a ?? a);
+        const currB = safeNumber((a as any)?.b ?? b);
+        const idx = ++crossCallIdx;
+        const key = `${p.id}|${symbol}|down|${idx}`;
+        const prev = crossPrev.get(key);
+        crossPrev.set(key, { a: currA, b: currB });
+        if (!prev) return false;
+        return prev.a >= prev.b && currA < currB;
+      };
+
       try {
         await runInSandbox(
           p.generated_js,
           {
             ...indicators,
+            CROSS_UP,
+            CROSS_DOWN,
+            COOLDOWN_OK,
+            IN_POSITION,
+            BARS_SINCE_ENTRY,
             HP,
             context,
           },
