@@ -319,8 +319,9 @@ function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
       const atrSma = lastFinite(atrSmaArr);
       if (!Number.isFinite(atrSma)) return false;
 
-      if (mode === "high") return currentAtr > mult * atrSma;
-      if (mode === "low") return currentAtr < (1 / mult) * atrSma;
+      // Accept both short form ("high"/"low") and full label form ("High Volatility"/"Low Volatility")
+      if (mode === "high" || mode.includes("high")) return currentAtr > mult * atrSma;
+      if (mode === "low" || mode.includes("low")) return currentAtr < (1 / mult) * atrSma;
       return false;
     },
 
