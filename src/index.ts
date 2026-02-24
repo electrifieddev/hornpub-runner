@@ -140,6 +140,9 @@ async function runProject(p: Project) {
   if (runErr) throw runErr;
   const runId = runRow.id;
 
+  let symbolFailures = 0;
+  let symbolTotal = 0;
+
   try {
     if (!p.generated_js || !p.generated_js.trim()) {
       await log(p.id, p.owner_id, "warn", "No generated_js found. Skipping run.");
@@ -168,6 +171,7 @@ async function runProject(p: Project) {
     const timeframes = extractTimeframesFromCode(p.generated_js) ?? ["1m"];
 
     for (const symbol of symbols) {
+      symbolTotal++;
       // Preload the cache for all required timeframes *before* executing the strategy.
       // If a symbol is invalid or has no data, skip it but keep the run alive.
       let preloadOk = true;
@@ -291,29 +295,35 @@ async function runProject(p: Project) {
           { timeoutMs: 5000 }
         );
       } catch (e: any) {
-        // High-signal per-symbol failure without spamming every tick.
+        // Log per-symbol failure but continue to the next symbol.
+        symbolFailures++;
         await log(p.id, p.owner_id, "error", `Strategy error for ${symbol}: ${e?.message ?? String(e)}`,
           { run_id: runId, symbol, exchange: "binance" }
         );
-        throw e;
       }
     }
 
     await log(p.id, p.owner_id, "info", "Run finished OK.", { run_id: runId });
 
+    const runStatus = symbolFailures > 0 && symbolTotal > 0 ? "partial_error" : "ok";
+    const runSummary = symbolFailures > 0
+      ? `${symbolFailures}/${symbolTotal} symbols failed`
+      : undefined;
+
     await supabase
       .from("project_runs")
       .update({
-        status: "ok",
+        status: runStatus,
         finished_at: new Date().toISOString(),
+        ...(runSummary ? { summary: runSummary } : {}),
       })
       .eq("id", runId);
 
     await supabase
       .from("projects")
       .update({
-        last_run_status: "ok",
-        last_run_error: null,
+        last_run_status: runStatus,
+        last_run_error: runSummary ?? null,
       })
       .eq("id", p.id);
   } catch (e: any) {

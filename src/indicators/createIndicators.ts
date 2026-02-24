@@ -168,9 +168,10 @@ function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
       return v;
     },
 
-    ATR: (p: { tf: string; period: number }): number => {
+    ATR: (p: { tf: string; period?: number; length?: number; smoothing?: string }): number => {
       const tf = String((p as any).tf ?? "1m");
-      const period = Math.max(1, Math.floor(Number((p as any).period ?? 0)));
+      // Accept both `period` (backend convention) and `length` (Blockly generator emits this)
+      const period = Math.max(1, Math.floor(Number((p as any).period ?? (p as any).length ?? 0)));
       const key = `${tf}|ATR|${period}`;
       const hit = numCache.get(key);
       if (hit !== undefined) return hit;
@@ -244,7 +245,183 @@ function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
       return out;
     },
 
-    // === New Blockly runtime surface (Checkpoint 4: breakout) ===
+    // === B-18: Missing indicators used by Blockly generators ===
+
+    /** Returns the latest value of any price source (Close, Open, High, Low, HL2, etc.) */
+    PRICE: (p: { tf: string; source?: unknown }): number => {
+      const tf = String((p as any).tf ?? "1m");
+      const source = (p as any).source ?? "Close";
+      const values = getSource(tf, source);
+      return lastFinite(values);
+    },
+
+    /** Returns the latest volume bar */
+    VOLUME: (p: { tf: string }): number => {
+      const tf = String((p as any).tf ?? "1m");
+      const series = cache.getSeries(ctx.exchange, ctx.symbol, tf);
+      if (!series) return Number.NaN;
+      return lastFinite(series.volumes);
+    },
+
+    /**
+     * Bollinger Bands — alias for BBANDS but accepts `std` instead of `mult` so
+     * the Blockly generator emission  `BOLLINGER({ tf, source, length, std })`
+     * maps correctly.
+     */
+    BOLLINGER: (p: { tf: string; source?: unknown; length: number; std?: number; mult?: number }): { upper: number; middle: number; lower: number } => {
+      const tf = String((p as any).tf ?? "1m");
+      const source = (p as any).source ?? "Close";
+      const length = Math.max(1, Math.floor(Number((p as any).length ?? 20)));
+      // Accept both `std` (Blockly) and `mult` (internal) for multiplier
+      const mult = Number((p as any).std ?? (p as any).mult ?? 2);
+      const key = `${tf}|BOLLINGER|${String(source)}|${length}|${mult}`;
+      const hit = objCache.get(key);
+      if (hit) return hit;
+      const values = getSource(tf, source);
+      const out = bbandsLatest(values, length, mult);
+      objCache.set(key, out);
+      return out;
+    },
+
+    /**
+     * Volatility regime: returns "high" | "low" | "normal" based on ATR vs its own SMA.
+     * mode: "high" → current ATR > mult × atrSMA; "low" → current ATR < (1/mult) × atrSMA
+     */
+    VOLATILITY_REGIME: (p: { tf: string; atrLength?: number; mult?: number; mode?: string }): boolean => {
+      const tf = String((p as any).tf ?? "1m");
+      const atrLength = Math.max(1, Math.floor(Number((p as any).atrLength ?? 14)));
+      const mult = Number((p as any).mult ?? 1.5);
+      const mode = String((p as any).mode ?? "high").toLowerCase();
+
+      const series = cache.getSeries(ctx.exchange, ctx.symbol, tf);
+      if (!series) return false;
+
+      const currentAtr = atrCalc(series.highs, series.lows, series.closes, atrLength);
+      if (!Number.isFinite(currentAtr)) return false;
+
+      // Build an ATR series to compute its SMA.  We need at minimum 2*atrLength bars.
+      const len = Math.min(series.highs.length, series.lows.length, series.closes.length);
+      if (len < atrLength * 2 + 1) return false;
+
+      // Rolling ATR approximation: compute ATR over trailing windows for SMA.
+      const atrSeries: number[] = [];
+      const step = Math.max(1, Math.floor(atrLength / 2));
+      for (let end = atrLength * 2; end <= len; end += step) {
+        const h = series.highs.slice(end - atrLength * 2, end);
+        const l = series.lows.slice(end - atrLength * 2, end);
+        const c = series.closes.slice(end - atrLength * 2, end);
+        const v = atrCalc(h, l, c, atrLength);
+        if (Number.isFinite(v)) atrSeries.push(v);
+      }
+
+      if (atrSeries.length === 0) return false;
+      const atrSmaArr = sma(atrSeries, Math.min(14, atrSeries.length));
+      const atrSma = lastFinite(atrSmaArr);
+      if (!Number.isFinite(atrSma)) return false;
+
+      if (mode === "high") return currentAtr > mult * atrSma;
+      if (mode === "low") return currentAtr < (1 / mult) * atrSma;
+      return false;
+    },
+
+    /** Highest value of a source series over the last `length` bars (inclusive of current) */
+    HIGHEST: (p: { tf: string; source?: unknown; length: number }): number => {
+      const tf = String((p as any).tf ?? "1m");
+      const source = (p as any).source ?? "Close";
+      const length = Math.max(1, Math.floor(Number((p as any).length ?? 1)));
+      const values = getSource(tf, source);
+      if (values.length === 0) return Number.NaN;
+      const start = Math.max(0, values.length - length);
+      let mx = -Infinity;
+      for (let i = start; i < values.length; i++) {
+        const v = values[i]!;
+        if (Number.isFinite(v) && v > mx) mx = v;
+      }
+      return Number.isFinite(mx) ? mx : Number.NaN;
+    },
+
+    /** Lowest value of a source series over the last `length` bars (inclusive of current) */
+    LOWEST: (p: { tf: string; source?: unknown; length: number }): number => {
+      const tf = String((p as any).tf ?? "1m");
+      const source = (p as any).source ?? "Close";
+      const length = Math.max(1, Math.floor(Number((p as any).length ?? 1)));
+      const values = getSource(tf, source);
+      if (values.length === 0) return Number.NaN;
+      const start = Math.max(0, values.length - length);
+      let mn = Infinity;
+      for (let i = start; i < values.length; i++) {
+        const v = values[i]!;
+        if (Number.isFinite(v) && v < mn) mn = v;
+      }
+      return Number.isFinite(mn) ? mn : Number.NaN;
+    },
+
+    /** Highest High over the last `length` bars */
+    HIGHEST_HIGH: (p: { tf: string; length: number }): number => {
+      const tf = String((p as any).tf ?? "1m");
+      const length = Math.max(1, Math.floor(Number((p as any).length ?? 1)));
+      const series = cache.getSeries(ctx.exchange, ctx.symbol, tf);
+      if (!series) return Number.NaN;
+      const start = Math.max(0, series.highs.length - length);
+      let mx = -Infinity;
+      for (let i = start; i < series.highs.length; i++) {
+        const v = series.highs[i]!;
+        if (Number.isFinite(v) && v > mx) mx = v;
+      }
+      return Number.isFinite(mx) ? mx : Number.NaN;
+    },
+
+    /** Lowest Low over the last `length` bars */
+    LOWEST_LOW: (p: { tf: string; length: number }): number => {
+      const tf = String((p as any).tf ?? "1m");
+      const length = Math.max(1, Math.floor(Number((p as any).length ?? 1)));
+      const series = cache.getSeries(ctx.exchange, ctx.symbol, tf);
+      if (!series) return Number.NaN;
+      const start = Math.max(0, series.lows.length - length);
+      let mn = Infinity;
+      for (let i = start; i < series.lows.length; i++) {
+        const v = series.lows[i]!;
+        if (Number.isFinite(v) && v < mn) mn = v;
+      }
+      return Number.isFinite(mn) ? mn : Number.NaN;
+    },
+
+    /**
+     * Returns the value of `series` `bars` bars ago.
+     * `series` should be a number produced by any indicator call — but since the
+     * sandbox surface exposes scalar values (not arrays), PREV stores the rolling
+     * history itself using a per-key seriesCache.
+     *
+     * Usage:  PREV({ series: EMA({...}), bars: 1 })
+     * Note:   The value accumulates across ticks because seriesCache is rebuilt
+     *         fresh each tick.  For genuine multi-tick memory, strategies should
+     *         rely on CROSS_UP / CROSS_DOWN.  PREV is most useful for confirming
+     *         the prior bar's value within a single tick.
+     */
+    PREV: (p: { series: number; bars?: number }): number => {
+      const bars = Math.max(1, Math.floor(Number((p as any).bars ?? 1)));
+      const currVal = Number((p as any).series);
+      // Build a rolling buffer under a deterministic key (call-site ordering).
+      const prevCallKey = `prev_call_counter`;
+      const callCount = (numCache.get(prevCallKey) ?? 0) + 1;
+      numCache.set(prevCallKey, callCount);
+      const bufKey = `PREV_buf_${callCount}`;
+
+      let buf = seriesCache.get(bufKey);
+      if (!buf) {
+        buf = [];
+        seriesCache.set(bufKey, buf);
+      }
+      // Append current value.
+      if (Number.isFinite(currVal)) buf.push(currVal);
+
+      // Return the value `bars` positions from the end (before the current append).
+      const idx = buf.length - 1 - bars;
+      if (idx < 0) return Number.NaN;
+      return buf[idx]!;
+    },
+
+
     BREAKOUT_UP: (p: { tf: string; source?: unknown; lookback: number; level?: number }): boolean => {
       const tf = String((p as any).tf ?? "1m");
       const source = (p as any).source ?? "Close";
@@ -329,6 +506,25 @@ function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
       const fast = ema(closes, p.fast);
       const slow = ema(closes, p.slow);
       return crossDown(fast, slow);
+    },
+
+    SMA_CROSS_DOWN: (p: SmaCrossParams): boolean => {
+      const closes = getCloses(cache, ctx, p.tf);
+      const fast = sma(closes, p.fast);
+      const slow = sma(closes, p.slow);
+      return crossDown(fast, slow);
+    },
+
+    MACD_CROSS_DOWN: (p: MacdCrossParams): boolean => {
+      const closes = getCloses(cache, ctx, p.tf);
+      const fast = ema(closes, p.fast);
+      const slow = ema(closes, p.slow);
+      if (fast.length === 0 || slow.length === 0) return false;
+      const macdLine: number[] = [];
+      const len = Math.min(fast.length, slow.length);
+      for (let i = 0; i < len; i++) macdLine.push(fast[i]! - slow[i]!);
+      const signal = ema(macdLine, p.signal);
+      return crossDown(macdLine, signal);
     },
   };
 }

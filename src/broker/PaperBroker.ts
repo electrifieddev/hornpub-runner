@@ -256,8 +256,8 @@ export class PaperBroker {
       .from("project_positions")
       .update({
         qty: remainingQty,
-        exit_price: price,
-        exit_time: now,
+        // B-04 fix: only update qty and running realized_pnl — do NOT set exit_price/exit_time
+        // on a still-open position, or queries using `exit_price IS NOT NULL` will misread it.
         realized_pnl: prevRealized + realized,
       })
       .eq("id", pos.id);
