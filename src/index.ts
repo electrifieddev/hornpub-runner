@@ -1,4 +1,4 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { KlineManager } from "./klines/KlineManager.js";
 import { SupabaseKlineStore } from "./klines/SupabaseKlineStore.js";
 import { KlineCache } from "./klines/KlineCache.js";
@@ -40,7 +40,7 @@ function isWeekend(): boolean {
 }
 
 /** Count trades executed today (UTC) for this project+symbol. */
-async function countTradesToday(supabase: ReturnType<typeof createClient>, projectId: string, symbol: string): Promise<number> {
+async function countTradesToday(supabase: SupabaseClient, projectId: string, symbol: string): Promise<number> {
   const start = new Date();
   start.setUTCHours(0, 0, 0, 0);
   const { count } = await supabase
