@@ -540,7 +540,6 @@ function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
       return crossUp(macdLine, signal);
     },
 
-    // Legacy helper retained for compatibility (not used by new Blockly blocks)
     EMA_CROSS_DOWN: (p: EmaCrossParams): boolean => {
       const closes = getCloses(cache, ctx, p.tf);
       const fast = ema(closes, p.fast);
@@ -566,7 +565,165 @@ function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
       const signal = ema(macdLine, p.signal);
       return crossDown(macdLine, signal);
     },
+
+    // ── Candle Pattern Detection (OHLC-based, deterministic) ──────────────
+
+    /**
+     * CANDLE_PATTERN: detects common single/two-bar candle patterns from OHLC data.
+     * pattern: "Doji" | "Bullish Engulfing" | "Bearish Engulfing" | "Hammer" | "Shooting Star"
+     * Returns true if the pattern is detected on the most recent completed candle.
+     */
+    CANDLE_PATTERN: (p: { tf: string; pattern: string; dojiThreshold?: number }): boolean => {
+      const tf = String((p as any).tf ?? "1m");
+      const pattern = String((p as any).pattern ?? "Doji");
+      const dojiPct = Number((p as any).dojiThreshold ?? 0.1); // body < 10% of range
+      const series = cache.getSeries(ctx.exchange, ctx.symbol, tf);
+      if (!series || series.opens.length < 2) return false;
+
+      const n = series.opens.length;
+      const o = series.opens[n - 1]!;
+      const h = series.highs[n - 1]!;
+      const l = series.lows[n - 1]!;
+      const c = series.closes[n - 1]!;
+      // Prior candle
+      const po = series.opens[n - 2]!;
+      const ph = series.highs[n - 2]!;
+      const pl = series.lows[n - 2]!;
+      const pc = series.closes[n - 2]!;
+
+      const range = h - l;
+      if (!Number.isFinite(range) || range <= 0) return false;
+      const body = Math.abs(c - o);
+
+      switch (pattern) {
+        case "Doji": {
+          // Body is <= dojiPct of full high-low range
+          return body / range <= dojiPct;
+        }
+        case "Bullish Engulfing": {
+          // Prior candle: bearish (close < open). Current: bullish body engulfs prior body.
+          const priorBearish = pc < po;
+          const currBullish = c > o;
+          return priorBearish && currBullish && o <= pc && c >= po;
+        }
+        case "Bearish Engulfing": {
+          // Prior candle: bullish (close > open). Current: bearish body engulfs prior body.
+          const priorBullish = pc > po;
+          const currBearish = c < o;
+          return priorBullish && currBearish && o >= pc && c <= po;
+        }
+        case "Hammer": {
+          // Small body in upper third of range, long lower shadow (>= 2x body), minimal upper shadow
+          const lowerShadow = Math.min(o, c) - l;
+          const upperShadow = h - Math.max(o, c);
+          return body / range <= 0.33 && lowerShadow >= 2 * body && upperShadow <= body;
+        }
+        case "Shooting Star": {
+          // Small body in lower third of range, long upper shadow (>= 2x body), minimal lower shadow
+          const lowerShadow = Math.min(o, c) - l;
+          const upperShadow = h - Math.max(o, c);
+          return body / range <= 0.33 && upperShadow >= 2 * body && lowerShadow <= body;
+        }
+        default:
+          return false;
+      }
+    },
+
+    /**
+     * VOLUME_SPIKE: returns true if current bar's volume exceeds avgMultiplier × SMA(volume, avgPeriod).
+     * Default: current volume > 2× its 20-bar average.
+     */
+    VOLUME_SPIKE: (p: { tf: string; avgPeriod?: number; avgMultiplier?: number }): boolean => {
+      const tf = String((p as any).tf ?? "1m");
+      const avgPeriod = Math.max(1, Math.floor(Number((p as any).avgPeriod ?? 20)));
+      const mult = Number((p as any).avgMultiplier ?? 2);
+      const series = cache.getSeries(ctx.exchange, ctx.symbol, tf);
+      if (!series || series.volumes.length < avgPeriod + 1) return false;
+      const vols = series.volumes;
+      const currentVol = vols[vols.length - 1]!;
+      // Average of the prior avgPeriod bars (excluding current)
+      const start = vols.length - 1 - avgPeriod;
+      let sum = 0;
+      let cnt = 0;
+      for (let i = Math.max(0, start); i < vols.length - 1; i++) {
+        const v = vols[i]!;
+        if (Number.isFinite(v)) { sum += v; cnt++; }
+      }
+      if (cnt === 0) return false;
+      const avg = sum / cnt;
+      if (!Number.isFinite(avg) || avg <= 0) return false;
+      return Number.isFinite(currentVol) && currentVol >= mult * avg;
+    },
+
+    /**
+     * PRICE_CHANGE_PCT: returns the percentage price change over the last `bars` bars.
+     * e.g. PRICE_CHANGE_PCT({ tf: "4h", bars: 4 }) > 2  ← price up >2% in last 4×4h candles
+     */
+    PRICE_CHANGE_PCT: (p: { tf: string; bars?: number }): number => {
+      const tf = String((p as any).tf ?? "1m");
+      const bars = Math.max(1, Math.floor(Number((p as any).bars ?? 1)));
+      const series = cache.getSeries(ctx.exchange, ctx.symbol, tf);
+      if (!series || series.closes.length < bars + 1) return Number.NaN;
+      const closes = series.closes;
+      const current = closes[closes.length - 1]!;
+      const prior = closes[closes.length - 1 - bars]!;
+      if (!Number.isFinite(current) || !Number.isFinite(prior) || prior === 0) return Number.NaN;
+      return ((current - prior) / prior) * 100;
+    },
+
+    /**
+     * TAKE_PROFIT: returns true if current mark price is >= entry_price × (1 + pct/100).
+     * Intended to be used in the block workflow to conditionally sell:
+     *   if TAKE_PROFIT({ pct: 5 }) → SELL 100%
+     * The block does NOT automatically sell — it only evaluates the condition so the user
+     * can wire it to a SELL block in their strategy.
+     */
+    TAKE_PROFIT: (p: { pct: number; entryPrice?: number }): boolean => {
+      const pct = Number((p as any).pct ?? 0);
+      if (!Number.isFinite(pct) || pct <= 0) return false;
+      const explicitEntry = (p as any)?.entryPrice;
+      // entryPrice can be passed explicitly or looked up from the open position
+      // via the kline cache (mark price). For block usage the engine exposes entry
+      // via IN_POSITION / openPos; here we rely on the caller supplying entryPrice
+      // or use a sentinel NaN to indicate no position.
+      if (explicitEntry !== undefined) {
+        const ep = Number(explicitEntry);
+        const markPrice = series_getMarkPriceFromCache(cache, ctx);
+        if (!Number.isFinite(ep) || ep <= 0 || !markPrice) return false;
+        return markPrice >= ep * (1 + pct / 100);
+      }
+      return false; // Without entryPrice the block-level check uses HP.takeProfitCheck()
+    },
+
+    /**
+     * STOP_LOSS: returns true if current mark price is <= entry_price × (1 - pct/100).
+     * Same usage pattern as TAKE_PROFIT above.
+     */
+    STOP_LOSS: (p: { pct: number; entryPrice?: number }): boolean => {
+      const pct = Number((p as any).pct ?? 0);
+      if (!Number.isFinite(pct) || pct <= 0) return false;
+      const explicitEntry = (p as any)?.entryPrice;
+      if (explicitEntry !== undefined) {
+        const ep = Number(explicitEntry);
+        const markPrice = series_getMarkPriceFromCache(cache, ctx);
+        if (!Number.isFinite(ep) || ep <= 0 || !markPrice) return false;
+        return markPrice <= ep * (1 - pct / 100);
+      }
+      return false;
+    },
   };
+}
+
+/** Internal helper: read latest close from cache (same logic as PaperBroker.getMarkPrice). */
+function series_getMarkPriceFromCache(cache: KlineCache, ctx: IndicatorContext): number | null {
+  for (const tf of ["1m", "5m", "15m", "1h", "4h"]) {
+    const closes = cache.getCloses(ctx.exchange, ctx.symbol, tf);
+    if (!closes || closes.length === 0) continue;
+    const v = closes[closes.length - 1];
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
 }
 
 export default createIndicators;

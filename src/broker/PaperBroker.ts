@@ -41,6 +41,16 @@ export class PaperBroker {
     return null;
   }
 
+  /** Public accessor for mark price (used by TP/SL in the runner). */
+  getMarkPricePublic(): number | null {
+    return this.getMarkPrice();
+  }
+
+  /** Public accessor for the current open position (used by TP/SL in the runner). */
+  async getPosition(): Promise<any | null> {
+    return this.getOpenPosition();
+  }
+
   // Intentionally public so sandbox-exposed HP.log can forward to it.
   async log(level: LogLevel, message: string, meta: Record<string, any> = {}) {
     // Keep schema-flexible: put details in meta (jsonb).
