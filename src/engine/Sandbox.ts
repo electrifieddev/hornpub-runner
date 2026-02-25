@@ -30,14 +30,18 @@ export async function runInSandbox(
   for (const [k, v] of Object.entries(api)) sandbox[k] = v;
 
   // Provide harmless builtins that real JS expects.
+  // B-09: freeze the mutable globals so a malicious strategy cannot mutate
+  // Array.prototype / Object.prototype and corrupt subsequent sandboxed runs.
+  // Number, String, Boolean, BigInt are frozen implicitly (primitives/wrappers);
+  // we freeze the four container/utility globals that are actually mutable.
   sandbox.Math = freeze(Math);
-  sandbox.Date = Date;
+  sandbox.Date = freeze(Date);
   sandbox.Number = Number;
   sandbox.String = String;
   sandbox.Boolean = Boolean;
-  sandbox.Array = Array;
-  sandbox.Object = Object;
-  sandbox.JSON = JSON;
+  sandbox.Array = freeze(Array);
+  sandbox.Object = freeze(Object);
+  sandbox.JSON = freeze(JSON);
   sandbox.BigInt = BigInt;
 
   const context = vm.createContext(sandbox, {

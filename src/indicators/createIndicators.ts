@@ -218,10 +218,16 @@ function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
       return out;
     },
 
-    VWAP: (p: { tf: string; source?: unknown }): number => {
+    VWAP: (p: { tf: string; source?: unknown; reset?: string }): number => {
       const tf = String((p as any).tf ?? "1m");
       const source = (p as any).source ?? "Typical Price";
-      const key = `${tf}|VWAP|${String(source)}`;
+      // B-22: respect the reset parameter emitted by the Blockly generator.
+      // "Session" (default) resets at midnight UTC — matching exchange-displayed VWAP.
+      // "None" uses all loaded candles (legacy cumulative behaviour).
+      const resetRaw = String((p as any).reset ?? "Session").toLowerCase();
+      const sessionReset = resetRaw !== "none";
+
+      const key = `${tf}|VWAP|${String(source)}|${sessionReset ? "session" : "all"}`;
       const hit = numCache.get(key);
       if (hit !== undefined) return hit;
 
@@ -229,11 +235,22 @@ function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
       if (!series) return Number.NaN;
       const prices = getSource(tf, source);
       const vols = series.volumes;
-      const len = Math.min(prices.length, vols.length);
+      const openTimes = series.openTimes;
+      const len = Math.min(prices.length, vols.length, openTimes.length);
       if (len === 0) return Number.NaN;
+
+      // Determine the session start (midnight UTC of the most recent candle's day).
+      let sessionStartMs = 0;
+      if (sessionReset) {
+        const lastOpenMs = openTimes[len - 1]!;
+        const d = new Date(lastOpenMs);
+        sessionStartMs = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+      }
+
       let pv = 0;
       let vSum = 0;
       for (let i = 0; i < len; i++) {
+        if (sessionReset && openTimes[i]! < sessionStartMs) continue;
         const price = prices[i]!;
         const vol = vols[i]!;
         if (!Number.isFinite(price) || !Number.isFinite(vol)) continue;
@@ -423,56 +440,78 @@ function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
     },
 
 
-    BREAKOUT_UP: (p: { tf: string; source?: unknown; lookback: number; level?: number }): boolean => {
+    BREAKOUT_UP: (p: { tf: string; source?: unknown; lookback: number; level?: number; confirm?: number }): boolean => {
       const tf = String((p as any).tf ?? "1m");
       const source = (p as any).source ?? "Close";
       const lookback = Math.max(1, Math.floor(Number((p as any).lookback ?? 0)));
       const levelRaw = (p as any).level;
       const level = levelRaw === undefined || levelRaw === null ? null : Number(levelRaw);
+      // confirm: number of consecutive closing bars that must all be above the threshold.
+      // Defaults to 1 (current bar only), matching the previous single-bar behaviour.
+      const confirm = Math.max(1, Math.floor(Number((p as any).confirm ?? 1)));
 
       const values = getSource(tf, source);
-      if (values.length < 2) return false;
-      const curr = values[values.length - 1]!;
-      if (!Number.isFinite(curr)) return false;
+      if (values.length < confirm + 1) return false;
 
-      // If a level is provided, treat it as an explicit threshold.
-      if (level !== null && Number.isFinite(level)) return curr > level;
-
-      // Otherwise compare against prior `lookback` bars (exclude current bar).
-      const end = values.length - 1;
-      const start = Math.max(0, end - lookback);
-      if (end - start < 1) return false;
-      let mx = -Infinity;
-      for (let i = start; i < end; i++) {
-        const v = values[i]!;
-        if (Number.isFinite(v) && v > mx) mx = v;
+      // Determine the threshold against which we confirm.
+      let threshold: number;
+      if (level !== null && Number.isFinite(level as number)) {
+        threshold = level as number;
+      } else {
+        // Use the highest value over the `lookback` bars that precede the confirmation window.
+        const windowEnd = values.length - confirm; // exclusive end of the pre-confirm history
+        const histStart = Math.max(0, windowEnd - lookback);
+        if (windowEnd - histStart < 1) return false;
+        let mx = -Infinity;
+        for (let i = histStart; i < windowEnd; i++) {
+          const v = values[i]!;
+          if (Number.isFinite(v) && v > mx) mx = v;
+        }
+        if (!Number.isFinite(mx)) return false;
+        threshold = mx;
       }
-      return Number.isFinite(mx) ? curr > mx : false;
+
+      // All `confirm` closing bars (most recent first) must exceed the threshold.
+      for (let i = values.length - confirm; i < values.length; i++) {
+        const v = values[i]!;
+        if (!Number.isFinite(v) || v <= threshold) return false;
+      }
+      return true;
     },
 
-    BREAKOUT_DOWN: (p: { tf: string; source?: unknown; lookback: number; level?: number }): boolean => {
+    BREAKOUT_DOWN: (p: { tf: string; source?: unknown; lookback: number; level?: number; confirm?: number }): boolean => {
       const tf = String((p as any).tf ?? "1m");
       const source = (p as any).source ?? "Close";
       const lookback = Math.max(1, Math.floor(Number((p as any).lookback ?? 0)));
       const levelRaw = (p as any).level;
       const level = levelRaw === undefined || levelRaw === null ? null : Number(levelRaw);
+      const confirm = Math.max(1, Math.floor(Number((p as any).confirm ?? 1)));
 
       const values = getSource(tf, source);
-      if (values.length < 2) return false;
-      const curr = values[values.length - 1]!;
-      if (!Number.isFinite(curr)) return false;
+      if (values.length < confirm + 1) return false;
 
-      if (level !== null && Number.isFinite(level)) return curr < level;
-
-      const end = values.length - 1;
-      const start = Math.max(0, end - lookback);
-      if (end - start < 1) return false;
-      let mn = Infinity;
-      for (let i = start; i < end; i++) {
-        const v = values[i]!;
-        if (Number.isFinite(v) && v < mn) mn = v;
+      let threshold: number;
+      if (level !== null && Number.isFinite(level as number)) {
+        threshold = level as number;
+      } else {
+        const windowEnd = values.length - confirm;
+        const histStart = Math.max(0, windowEnd - lookback);
+        if (windowEnd - histStart < 1) return false;
+        let mn = Infinity;
+        for (let i = histStart; i < windowEnd; i++) {
+          const v = values[i]!;
+          if (Number.isFinite(v) && v < mn) mn = v;
+        }
+        if (!Number.isFinite(mn)) return false;
+        threshold = mn;
       }
-      return Number.isFinite(mn) ? curr < mn : false;
+
+      // All `confirm` closing bars must be below the threshold.
+      for (let i = values.length - confirm; i < values.length; i++) {
+        const v = values[i]!;
+        if (!Number.isFinite(v) || v >= threshold) return false;
+      }
+      return true;
     },
 
     EMA_CROSS_UP: (p: EmaCrossParams): boolean => {

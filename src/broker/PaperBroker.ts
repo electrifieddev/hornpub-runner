@@ -97,19 +97,22 @@ export class PaperBroker {
   }
 
   /**
-   * Paper buy: opens a LONG position if none exists.
-   * If a position exists, it logs and does nothing.
+   * Paper buy: opens a new LONG position, or merges into an existing one.
+   *
+   * When a position is already open the new fill is averaged in:
+   *   avgEntryPrice = (existingQty × existingEntry + newQty × fillPrice)
+   *                   / (existingQty + newQty)
+   * The position qty and entry_price are updated in-place; no new position row
+   * is created.  This lets users add to a running position rather than being
+   * blocked.
+   *
+   * The existing safeguard that prevents selling when there is no open position
+   * is unchanged (see sell()).
    */
   async buy(args: BuyArgs) {
     const usd = Number(args?.usd ?? 0);
     if (!Number.isFinite(usd) || usd <= 0) {
       await this.log("warn", "BUY skipped: invalid usd", { usd });
-      return;
-    }
-
-    const existing = await this.getOpenPosition();
-    if (existing) {
-      await this.log("info", "BUY skipped: position already open", { existing_id: existing.id, usd });
       return;
     }
 
@@ -119,33 +122,75 @@ export class PaperBroker {
       return;
     }
 
-    const qty = usd / price;
+    const newQty = usd / price;
     const now = new Date().toISOString();
 
+    const existing = await this.getOpenPosition();
+
+    if (existing) {
+      // Merge into the existing position using a volume-weighted average entry price.
+      const existingQty = Number(existing.qty ?? 0);
+      const existingEntry = Number(existing.entry_price ?? 0);
+
+      if (!Number.isFinite(existingQty) || existingQty <= 0 || !Number.isFinite(existingEntry)) {
+        await this.log("error", "BUY merge failed: invalid stored position", { position_id: existing.id });
+        return;
+      }
+
+      const totalQty = existingQty + newQty;
+      const avgEntry = (existingQty * existingEntry + newQty * price) / totalQty;
+
+      const { error } = await this.sb
+        .from("project_positions")
+        .update({ qty: totalQty, entry_price: avgEntry })
+        .eq("id", existing.id);
+      if (error) throw error;
+
+      await this.insertTrade({
+        side: "buy",
+        qty: newQty,
+        price,
+        realizedPnl: 0,
+        fee: 0,
+        ts: now,
+        positionId: existing.id,
+        meta: { usd, reason: "strategy", kind: "add_to_position", avg_entry: avgEntry },
+      });
+
+      await this.log("info", "BUY executed (paper, added to position)", {
+        usd,
+        price,
+        new_qty: newQty,
+        total_qty: totalQty,
+        avg_entry: avgEntry,
+        position_id: existing.id,
+      });
+      return;
+    }
+
+    // No existing position — open a fresh one.
     const { data, error } = await this.sb
       .from("project_positions")
       .insert({
-      user_id: this.ctx.userId,
-      project_id: this.ctx.projectId,
-      symbol: this.ctx.symbol,
-      side: "long",
-      status: "open",
-      qty,
-      entry_price: price,
-      entry_time: now,
-      exit_price: null,
-      exit_time: null,
-      realized_pnl: null,
-    })
+        user_id: this.ctx.userId,
+        project_id: this.ctx.projectId,
+        symbol: this.ctx.symbol,
+        side: "long",
+        status: "open",
+        qty: newQty,
+        entry_price: price,
+        entry_time: now,
+        exit_price: null,
+        exit_time: null,
+        realized_pnl: null,
+      })
       .select("id")
       .maybeSingle();
     if (error) {
-      // If multiple runners / concurrent BUY calls happen, DB uniqueness is the final guard.
-      // Treat "already open" as a no-op instead of failing the whole run.
-      // Postgres unique violation: 23505
+      // Concurrent BUY race: treat DB uniqueness violation as a no-op.
       const anyErr: any = error;
       if (anyErr?.code === "23505") {
-        await this.log("info", "BUY skipped: position already open (db constraint)", { usd, price, qty });
+        await this.log("info", "BUY skipped: position already open (db constraint)", { usd, price, qty: newQty });
         return;
       }
       throw error;
@@ -153,16 +198,16 @@ export class PaperBroker {
 
     await this.insertTrade({
       side: "buy",
-      qty,
+      qty: newQty,
       price,
       realizedPnl: 0,
       fee: 0,
       ts: now,
       positionId: (data as any)?.id ?? null,
-      meta: { usd, reason: "strategy" },
+      meta: { usd, reason: "strategy", kind: "open_position" },
     });
 
-    await this.log("info", "BUY executed (paper)", { usd, price, qty });
+    await this.log("info", "BUY executed (paper, new position)", { usd, price, qty: newQty });
   }
 
   /**
