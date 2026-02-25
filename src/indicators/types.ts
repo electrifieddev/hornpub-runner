@@ -11,4 +11,6 @@ export type MacdCrossParams = { tf: Tf; fast: number; slow: number; signal: numb
 export type IndicatorContext = {
   exchange: string;
   symbol: string;
+  /** Optional — used to namespace PREV buffers so multi-project runners don't collide. */
+  projectId?: string;
 };

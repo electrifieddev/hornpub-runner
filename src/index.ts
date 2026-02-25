@@ -43,11 +43,15 @@ function isWeekend(): boolean {
 async function countTradesToday(supabase: SupabaseClient, projectId: string, symbol: string): Promise<number> {
   const start = new Date();
   start.setUTCHours(0, 0, 0, 0);
+  // Count only buy-side (entry) trades. Sell/exit fills must not count against
+  // the daily limit, otherwise a single round-trip would consume two slots and
+  // could trap an open position by blocking the strategy from re-entering.
   const { count } = await supabase
     .from("project_trades")
     .select("id", { count: "exact", head: true })
     .eq("project_id", projectId)
     .eq("symbol", symbol)
+    .eq("side", "buy")
     .gte("ts", start.toISOString());
   return count ?? 0;
 }
@@ -263,7 +267,7 @@ async function runProject(p: Project) {
         }
       }
 
-      const context = { exchange: "binance", symbol };
+      const context = { exchange: "binance", symbol, projectId: p.id };
       const indicators = createIndicators(klineCache, context);
 
       const broker = new PaperBroker({
@@ -292,10 +296,15 @@ async function runProject(p: Project) {
           const usd = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.usd ?? 0);
           // ignore symbol argument (engine runs per symbol)
           await broker.buy({ usd });
+          // Refresh snapshot so IN_POSITION / TAKE_PROFIT / STOP_LOSS are accurate
+          // for any checks that follow this buy within the same tick.
+          await refreshPositionRef();
         },
         sell: async (a: any, b?: any) => {
           const pct = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.pct ?? 100);
           await broker.sell({ pct });
+          // Refresh snapshot — position may now be closed or partially reduced.
+          await refreshPositionRef();
         },
         log: async (msg: string) => broker.log("info", String(msg)),
         /**
@@ -356,7 +365,7 @@ async function runProject(p: Project) {
 
       // === New Blockly runtime surface (Checkpoint 4: events/cooldown/state) ===
       // Snapshot position/trade state once per symbol execution (no per-call DB queries).
-      const { data: openPos } = await supabase
+      const { data: openPosInitial } = await supabase
         .from("project_positions")
         .select("id, entry_time, entry_price")
         .eq("project_id", p.id)
@@ -366,15 +375,31 @@ async function runProject(p: Project) {
 
       const lastTradeTs = await getLastTradeTs(p.id, symbol);
 
+      // Mutable ref so HP.buy / HP.sell can refresh the snapshot within the same tick.
+      // Without this, IN_POSITION / TAKE_PROFIT / STOP_LOSS would read stale state after
+      // a buy or sell that happened earlier in the same strategy execution.
+      const positionRef = { current: openPosInitial as typeof openPosInitial | null };
+
+      async function refreshPositionRef() {
+        const { data } = await supabase
+          .from("project_positions")
+          .select("id, entry_time, entry_price")
+          .eq("project_id", p.id)
+          .eq("symbol", symbol)
+          .eq("status", "open")
+          .maybeSingle();
+        positionRef.current = data ?? null;
+      }
+
       // Cross detection uses a stable call index per execution.
       let crossCallIdx = 0;
 
-      const IN_POSITION = () => Boolean(openPos?.id);
+      const IN_POSITION = () => Boolean(positionRef.current?.id);
 
       // B-24: use the strategy's primary timeframe so bar counts match the chart the user sees.
       const BARS_SINCE_ENTRY = () => {
-        if (!openPos?.entry_time) return Number.POSITIVE_INFINITY;
-        return barsSinceTimestamp("binance", symbol, primaryTf, String(openPos.entry_time));
+        if (!positionRef.current?.entry_time) return Number.POSITIVE_INFINITY;
+        return barsSinceTimestamp("binance", symbol, primaryTf, String(positionRef.current.entry_time));
       };
 
       // B-06: implement scope variants. "entry" measures bars since position entry;
@@ -384,7 +409,7 @@ async function runProject(p: Project) {
         const scopeRaw = String((p2 as any)?.scope ?? "last_trade").toLowerCase();
         let referenceTs: string | null;
         if (scopeRaw === "entry") {
-          referenceTs = openPos?.entry_time ? String(openPos.entry_time) : null;
+          referenceTs = positionRef.current?.entry_time ? String(positionRef.current.entry_time) : null;
         } else {
           // "last_trade" and any future / unknown scope variants fall back to lastTradeTs.
           referenceTs = lastTradeTs;
@@ -398,8 +423,8 @@ async function runProject(p: Project) {
       // These are boolean checks only — the user must wire a SELL block after them.
       const TAKE_PROFIT = (p2: { pct: number }): boolean => {
         const pct = Number((p2 as any)?.pct ?? 0);
-        if (!Number.isFinite(pct) || pct <= 0 || !openPos) return false;
-        const entryPrice = Number(openPos.entry_price ?? 0);
+        if (!Number.isFinite(pct) || pct <= 0 || !positionRef.current) return false;
+        const entryPrice = Number(positionRef.current.entry_price ?? 0);
         if (!Number.isFinite(entryPrice) || entryPrice <= 0) return false;
         const markPrice = broker.getMarkPricePublic();
         if (!markPrice) return false;
@@ -415,8 +440,8 @@ async function runProject(p: Project) {
 
       const STOP_LOSS = (p2: { pct: number }): boolean => {
         const pct = Number((p2 as any)?.pct ?? 0);
-        if (!Number.isFinite(pct) || pct <= 0 || !openPos) return false;
-        const entryPrice = Number(openPos.entry_price ?? 0);
+        if (!Number.isFinite(pct) || pct <= 0 || !positionRef.current) return false;
+        const entryPrice = Number(positionRef.current.entry_price ?? 0);
         if (!Number.isFinite(entryPrice) || entryPrice <= 0) return false;
         const markPrice = broker.getMarkPricePublic();
         if (!markPrice) return false;
@@ -466,12 +491,12 @@ async function runProject(p: Project) {
             run_id: runId,
             symbol,
             mark_price: markPrice,
-            in_position: Boolean(openPos?.id),
+            in_position: Boolean(positionRef.current?.id),
           };
-          if (openPos) {
-            meta.entry_price = Number(openPos.entry_price ?? 0);
-            meta.entry_time = openPos.entry_time;
-            const ep = Number(openPos.entry_price ?? 0);
+          if (positionRef.current) {
+            meta.entry_price = Number(positionRef.current.entry_price ?? 0);
+            meta.entry_time = positionRef.current.entry_time;
+            const ep = Number(positionRef.current.entry_price ?? 0);
             if (markPrice && Number.isFinite(ep) && ep > 0) {
               meta.unrealized_pnl_pct = ((markPrice - ep) / ep * 100).toFixed(3) + "%";
             }
@@ -585,12 +610,12 @@ async function tick() {
   // B-07: evict crossPrev entries for projects that were NOT in this tick's batch.
   //        Entries for active projects are kept so CROSS_UP/DOWN can detect transitions
   //        between ticks.  Entries for removed/paused projects are pruned to bound memory.
-  if (activeProjectIds.size > 0) {
-    for (const key of crossPrev.keys()) {
-      const projectId = key.split("|")[0];
-      if (projectId && !activeProjectIds.has(projectId)) {
-        crossPrev.delete(key);
-      }
+  //        Note: pruning runs unconditionally — even when activeProjectIds is empty —
+  //        so a tick where all projects are paused fully drains the map rather than leaking.
+  for (const key of crossPrev.keys()) {
+    const projectId = key.split("|")[0];
+    if (projectId && !activeProjectIds.has(projectId)) {
+      crossPrev.delete(key);
     }
   }
 }

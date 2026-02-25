@@ -88,6 +88,14 @@ export function createIndicators(arg1: KlineCache | { cache: KlineCache; ctx: In
   return _createIndicators(cache, ctx);
 }
 
+// Module-level persistent store for PREV indicator buffers.
+// Keyed by `${projectId}|${exchange}|${symbol}|prev_${callIndex}`.
+// Lives outside _createIndicators so it survives across ticks — each call to
+// _createIndicators is a fresh scope, but PREV needs multi-tick history to work.
+// Maximum of 50 values per buffer keeps memory bounded.
+const _prevBuffers = new Map<string, number[]>();
+const PREV_MAX_BUF = 50;
+
 function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
   // Per-run/per-symbol cache for computed indicator arrays.
   const seriesCache = new Map<string, number[]>();
@@ -408,32 +416,43 @@ function _createIndicators(cache: KlineCache, ctx: IndicatorContext) {
      * Returns the value of `series` `bars` bars ago.
      * `series` should be a number produced by any indicator call — but since the
      * sandbox surface exposes scalar values (not arrays), PREV stores the rolling
-     * history itself using a per-key seriesCache.
+     * history itself in a module-level map that persists across ticks.
      *
      * Usage:  PREV({ series: EMA({...}), bars: 1 })
-     * Note:   The value accumulates across ticks because seriesCache is rebuilt
-     *         fresh each tick.  For genuine multi-tick memory, strategies should
-     *         rely on CROSS_UP / CROSS_DOWN.  PREV is most useful for confirming
-     *         the prior bar's value within a single tick.
+     *
+     * Each distinct call-site in a strategy gets its own buffer, identified by
+     * call order (the Nth PREV call in a given tick).  Buffers are capped at
+     * PREV_MAX_BUF entries to bound memory.
      */
     PREV: (p: { series: number; bars?: number }): number => {
       const bars = Math.max(1, Math.floor(Number((p as any).bars ?? 1)));
       const currVal = Number((p as any).series);
-      // Build a rolling buffer under a deterministic key (call-site ordering).
+
+      // Stable per-call-site index within this tick (resets each _createIndicators call,
+      // but the buffer key below includes it so each site has its own persistent buffer).
       const prevCallKey = `prev_call_counter`;
       const callCount = (numCache.get(prevCallKey) ?? 0) + 1;
       numCache.set(prevCallKey, callCount);
-      const bufKey = `PREV_buf_${callCount}`;
 
-      let buf = seriesCache.get(bufKey);
+      // Persistent buffer key — includes projectId so multi-project runners don't collide.
+      const ns = ctx.projectId ?? ctx.exchange;
+      const bufKey = `${ns}|${ctx.symbol}|prev_${callCount}`;
+
+      let buf = _prevBuffers.get(bufKey);
       if (!buf) {
         buf = [];
-        seriesCache.set(bufKey, buf);
+        _prevBuffers.set(bufKey, buf);
       }
-      // Append current value.
-      if (Number.isFinite(currVal)) buf.push(currVal);
 
-      // Return the value `bars` positions from the end (before the current append).
+      // Append the current value, then cap the buffer length to avoid unbounded growth.
+      if (Number.isFinite(currVal)) {
+        buf.push(currVal);
+        if (buf.length > PREV_MAX_BUF) buf.splice(0, buf.length - PREV_MAX_BUF);
+      }
+
+      // Return the value `bars` positions back from the latest (before current append).
+      // buf now contains the appended current value, so index from end is: length-1 = current,
+      // length-1-bars = `bars` ticks ago.
       const idx = buf.length - 1 - bars;
       if (idx < 0) return Number.NaN;
       return buf[idx]!;
