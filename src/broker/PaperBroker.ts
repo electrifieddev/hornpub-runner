@@ -239,21 +239,8 @@ export class PaperBroker {
 
     const pos = await this.getOpenPosition();
     if (!pos) {
-      // Per requirements: don't crash; record a trade row with realized_pnl=0 and warn.
-      const px = this.getMarkPrice();
-      const now = new Date().toISOString();
-      if (px) {
-        await this.insertTrade({
-          side: "sell",
-          qty: 0,
-          price: px,
-          realizedPnl: 0,
-          fee: 0,
-          ts: now,
-          positionId: null,
-          meta: { pct, kind: "no_position", reason: "strategy" },
-        });
-      }
+      // No open position — log a warning and do nothing.
+      // Do NOT insert a trade row; phantom sell records pollute Filled Orders.
       await this.log("warn", "SELL skipped: no open position", { pct });
       return;
     }
