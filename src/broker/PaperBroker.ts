@@ -28,11 +28,17 @@ export class PaperBroker {
 
   /** Latest close for pricing. Returns null if we don't have candles yet. */
   private getMarkPrice(): number | null {
-    const closes = this.cache.getCloses(this.ctx.exchange, this.ctx.symbol, this.ctx.tf);
-    if (!closes || closes.length === 0) return null;
-    const v = closes[closes.length - 1];
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
+    // Try the configured timeframe first, then fall back to 1m and common timeframes
+    // so strategies using non-1m intervals still get a mark price.
+    const candidates = [this.ctx.tf, "1m", "5m", "15m", "1h", "4h"];
+    for (const tf of candidates) {
+      const closes = this.cache.getCloses(this.ctx.exchange, this.ctx.symbol, tf);
+      if (!closes || closes.length === 0) continue;
+      const v = closes[closes.length - 1];
+      const n = Number(v);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
   }
 
   // Intentionally public so sandbox-exposed HP.log can forward to it.

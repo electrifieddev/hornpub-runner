@@ -106,42 +106,6 @@ async function log(
   }
 }
 
-async function hasOpenPosition(projectId: string, symbol: string) {
-  const { data, error } = await supabase
-    .from("project_positions")
-    .select("id")
-    .eq("project_id", projectId)
-    .eq("symbol", symbol)
-    .eq("status", "open")
-    .limit(1);
-
-  if (error) throw error;
-  return (data?.length ?? 0) > 0;
-}
-
-async function openPosition(projectId: string, ownerId: string, symbol: string, usd: number) {
-  // DB unique index should prevent duplicates if you created it.
-  const { error } = await supabase.from("project_positions").insert({
-    project_id: projectId,
-    user_id: ownerId, // project_positions expects user_id
-    symbol,
-    status: "open",
-    // add more fields later (entry_price, qty, etc.)
-    usd,
-  });
-  if (error) throw error;
-}
-
-async function closePosition(projectId: string, symbol: string) {
-  const { error } = await supabase
-    .from("project_positions")
-    .update({ status: "closed" })
-    .eq("project_id", projectId)
-    .eq("symbol", symbol)
-    .eq("status", "open");
-  if (error) throw error;
-}
-
 async function runProject(p: Project) {
   // Create run record (project_runs expects user_id)
   const { data: runRow, error: runErr } = await supabase
@@ -166,7 +130,7 @@ async function runProject(p: Project) {
       .eq("id", p.id)
       .single();
     if (projErr) throw projErr;
-    const symbols = (projRow?.symbols ?? []) as string[];
+    const symbols = [...new Set((projRow?.symbols ?? []) as string[])];
     // B-05: use generated_js from the fresh project row if the RPC didn't return it
     const freshJs = String((projRow as any)?.generated_js ?? p.generated_js ?? "").trim();
     if (!freshJs) {
@@ -307,7 +271,7 @@ async function runProject(p: Project) {
 
       try {
         await runInSandbox(
-          p.generated_js,
+          freshJs,
           {
             ...indicators,
             CROSS_UP,
@@ -392,7 +356,15 @@ async function tick() {
   const activeProjectIds = new Set(projects.map((p) => p.id));
 
   for (const p of projects) {
-    await runProject(p);
+    try {
+      await runProject(p);
+    } catch (e: any) {
+      // runProject has its own outer try/catch that updates project_runs to "error".
+      // This guard is a last resort in case the run-row insert itself throws — e.g.
+      // a Supabase outage at the very start of runProject. Without it the whole
+      // main loop would crash and all projects would stop running.
+      console.error(`[tick] runProject threw outside its own try/catch (project ${p.id}):`, e?.message ?? e);
+    }
   }
 
   // B-07: evict crossPrev entries for projects that were NOT in this tick's batch.
@@ -444,7 +416,10 @@ async function main() {
       }
       return syms;
     },
-    logger: (msg: string) => console.log(`[KLINES] ${msg}`),
+    logger: (msg: string, extra?: any) => {
+      if (extra !== undefined) console.log(`[KLINES] ${msg}`, extra);
+      else console.log(`[KLINES] ${msg}`);
+    },
   };
 
   // B-26: Instantiate one KlineManager per supported interval so indicator functions that
@@ -459,7 +434,7 @@ async function main() {
   const klineManagers = supportedIntervals.map(
     (interval) => new KlineManager({ ...klineManagerOpts, interval: interval as any })
   );
-  klineManagers.forEach((m) => m.start());
+  klineManagers.forEach((m) => m.start().catch((e) => console.error("[KLINES] start() threw unexpectedly:", e)));
   while (true) {
     await tick();
     await new Promise((r) => setTimeout(r, 2000));
