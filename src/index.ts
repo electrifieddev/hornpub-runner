@@ -130,7 +130,7 @@ async function runProject(p: Project) {
       .eq("id", p.id)
       .single();
     if (projErr) throw projErr;
-    const symbols = [...new Set((projRow?.symbols ?? []) as string[])];
+    const symbols = [...new Set(((projRow?.symbols ?? []) as string[]).map((s) => s.trim().toUpperCase()).filter(Boolean))];
     // B-05: use generated_js from the fresh project row if the RPC didn't return it
     const freshJs = String((projRow as any)?.generated_js ?? p.generated_js ?? "").trim();
     if (!freshJs) {
@@ -149,21 +149,31 @@ async function runProject(p: Project) {
     for (const symbol of symbols) {
       symbolTotal++;
       // Preload the cache for all required timeframes *before* executing the strategy.
-      // If a symbol is invalid or has no data, skip it but keep the run alive.
-      let preloadOk = true;
+      // Hard-skip the symbol only if the PRIMARY timeframe fails (indicators would be useless).
+      // Secondary timeframe failures are logged as warnings but execution continues — the
+      // indicators for that timeframe will return NaN, which strategies should handle gracefully.
+      let primaryPreloadOk = true;
       for (const tf of timeframes) {
+        const isPrimary = tf === primaryTf;
         try {
           await klineCache.preload("binance", symbol, tf, {
             maxCandles: Number(process.env.INDICATOR_MAX_CANDLES ?? 5000),
           });
         } catch (e: any) {
-          preloadOk = false;
-          await log(p.id, p.owner_id, "warn", `Klines unavailable for ${symbol} ${tf}: ${e?.message ?? String(e)}`,
-            { run_id: runId, symbol, tf, exchange: "binance" }
-          );
+          const msg = e?.message ?? String(e);
+          if (isPrimary) {
+            primaryPreloadOk = false;
+            await log(p.id, p.owner_id, "warn", `Primary klines unavailable for ${symbol} ${tf} — skipping symbol: ${msg}`,
+              { run_id: runId, symbol, tf, exchange: "binance" }
+            );
+          } else {
+            await log(p.id, p.owner_id, "warn", `Secondary klines unavailable for ${symbol} ${tf} — indicators for this tf will return NaN: ${msg}`,
+              { run_id: runId, symbol, tf, exchange: "binance" }
+            );
+          }
         }
       }
-      if (!preloadOk) continue;
+      if (!primaryPreloadOk) continue;
 
       const context = { exchange: "binance", symbol };
       const indicators = createIndicators(klineCache, context);
@@ -177,8 +187,9 @@ async function runProject(p: Project) {
           runId,
           symbol,
           exchange: "binance",
-          // Used only to get a "latest price" for sizing/PNL. Defaults to 1m.
-          tf: "1m",
+          // Primary timeframe for mark price. PaperBroker.getMarkPrice() also
+          // falls back through 1m → 5m → 15m → 1h → 4h if this tf has no data.
+          tf: primaryTf,
         },
       });
 

@@ -56,6 +56,18 @@ export async function runInSandbox(
   });
 
   const result = script.runInContext(context, { timeout: timeoutMs });
-  // result is a Promise due to wrapper
-  return await Promise.resolve(result);
+
+  // The vm `timeout` above fires only during *synchronous* execution of the script.
+  // Our IIFE wrapper is async, so runInContext returns a Promise almost immediately
+  // and the synchronous timeout stops protecting us after that point.
+  // Race against a manual deadline so strategies that loop on async calls
+  // (e.g. while(true) { await HP.buy(...) }) cannot hang the runner indefinitely.
+  const asyncTimeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(
+      () => reject(new Error(`Strategy execution timed out after ${timeoutMs}ms`)),
+      timeoutMs
+    )
+  );
+
+  return await Promise.race([Promise.resolve(result), asyncTimeoutPromise]);
 }
