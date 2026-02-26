@@ -203,10 +203,43 @@ export class PaperBroker {
       .select("id")
       .maybeSingle();
     if (error) {
-      // Concurrent BUY race: treat DB uniqueness violation as a no-op.
+      // Concurrent BUY race: another tick inserted a position between our read and write.
+      // Re-fetch the now-existing position and MERGE this buy into it rather than silently
+      // dropping the order. The old "no-op" behaviour caused silent trade loss when two
+      // ticks fired close together (interval_seconds < tick latency) — the duplicate key
+      // error was the symptom, and the dropped buy was the real damage.
       const anyErr: any = error;
       if (anyErr?.code === "23505") {
-        await this.log("info", "BUY skipped: position already open (db constraint)", { usd, price, qty: newQty });
+        const racePos = await this.getOpenPosition();
+        if (racePos) {
+          const existingQty = Number(racePos.qty ?? 0);
+          const existingEntry = Number(racePos.entry_price ?? 0);
+          if (Number.isFinite(existingQty) && existingQty > 0 && Number.isFinite(existingEntry)) {
+            const totalQty = existingQty + newQty;
+            const avgEntry = (existingQty * existingEntry + newQty * price) / totalQty;
+            const { error: mergeErr } = await this.sb
+              .from("project_positions")
+              .update({ qty: totalQty, entry_price: avgEntry })
+              .eq("id", racePos.id);
+            if (mergeErr) throw mergeErr;
+            await this.insertTrade({
+              side: "buy",
+              qty: newQty,
+              price,
+              realizedPnl: 0,
+              fee: 0,
+              ts: now,
+              positionId: racePos.id,
+              meta: { usd, reason: "strategy", kind: "add_to_position_race_merge", avg_entry: avgEntry },
+            });
+            await this.log("info", "BUY executed (paper, merged into race-concurrent position)", {
+              usd, price, new_qty: newQty, total_qty: totalQty, avg_entry: avgEntry, position_id: racePos.id,
+            });
+            return;
+          }
+        }
+        // Position exists but re-read returned nothing (extremely unlikely transient issue).
+        await this.log("warn", "BUY skipped: duplicate constraint hit but position unreadable on re-fetch", { usd, price, qty: newQty });
         return;
       }
       throw error;
