@@ -637,6 +637,7 @@ async function main() {
     return Math.max(10, Math.floor(Number(process.env.KLINE_REFRESH_EVERY_MS ?? 60_000) / 1000));
   })();
 
+  // ── Shared KlineManager options (everything except `interval`) ────────────
   const klineManagerOpts = {
     store: klineStore,
     exchange: "binance" as const,
@@ -662,21 +663,97 @@ async function main() {
     },
   };
 
-  // B-26: Instantiate one KlineManager per supported interval so indicator functions that
-  //        reference non-1m timeframes find populated cache entries instead of NaN.
-  //        The set of supported intervals is configurable via KLINE_INTERVALS (comma-separated),
-  //        defaulting to "1m" until operators explicitly opt into multi-timeframe support.
-  const supportedIntervals = (process.env.KLINE_INTERVALS ?? "1m")
+  // ── Dynamic interval discovery ─────────────────────────────────────────────
+  // Scan all active projects' generated_js to find every timeframe in use, then
+  // ensure a KlineManager is running for each one.  This means operators never
+  // need to manually set KLINE_INTERVALS — adding a 4h block to any strategy
+  // automatically starts keeping 4h klines fresh.
+  //
+  // KLINE_INTERVALS (comma-separated) can still be used to force extra intervals
+  // (e.g. pre-warm a timeframe before any strategy uses it), but it is no longer
+  // required for correctness.
+
+  const VALID_INTERVALS = new Set<string>([
+    "1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d",
+  ]);
+
+  // Always include 1m as the baseline interval.
+  const BASE_INTERVALS: string[] = ["1m"];
+
+  // Parse any operator-forced intervals from the env var.
+  const forcedIntervals = (process.env.KLINE_INTERVALS ?? "")
     .split(",")
     .map((s) => s.trim())
-    .filter(Boolean);
+    .filter((s) => VALID_INTERVALS.has(s));
 
-  const klineManagers = supportedIntervals.map(
-    (interval) => new KlineManager({ ...klineManagerOpts, interval: interval as any })
-  );
-  klineManagers.forEach((m) => m.start().catch((e) => console.error("[KLINES] start() threw unexpectedly:", e)));
+  /** Query DB for every timeframe referenced in active project code. */
+  async function getActiveTimeframes(): Promise<string[]> {
+    const statuses = (process.env.ACTIVE_PROJECT_STATUSES ?? "live,running").split(",").map((s) => s.trim()).filter(Boolean);
+    const { data, error } = await supabase
+      .from("projects")
+      .select("generated_js")
+      .in("status", statuses);
+    if (error) {
+      console.error("[KLINES] Could not query active project timeframes:", error.message);
+      return [];
+    }
+    const found = new Set<string>();
+    for (const row of data ?? []) {
+      const js = String((row as any).generated_js ?? "").trim();
+      if (!js) continue;
+      for (const tf of extractTimeframesFromCode(js)) {
+        if (VALID_INTERVALS.has(tf)) found.add(tf);
+      }
+    }
+    return [...found];
+  }
+
+  // Running managers keyed by interval so we never start duplicates.
+  const runningManagers = new Map<string, KlineManager>();
+
+  /** Ensure a KlineManager is running for each interval in the given set. */
+  function ensureManagers(intervals: string[]) {
+    for (const interval of intervals) {
+      if (runningManagers.has(interval)) continue;
+      console.log(`[KLINES] Starting KlineManager for interval: ${interval}`);
+      const m = new KlineManager({ ...klineManagerOpts, interval: interval as any });
+      runningManagers.set(interval, m);
+      m.start().catch((e) => console.error(`[KLINES] KlineManager(${interval}) threw unexpectedly:`, e));
+    }
+  }
+
+  // Seed with baseline + any forced intervals immediately so klines are warm
+  // before the first strategy tick fires.
+  ensureManagers([...BASE_INTERVALS, ...forcedIntervals]);
+
+  // Do an initial discovery pass so strategies that are already deployed get
+  // their timeframes before the first tick runs.
+  try {
+    ensureManagers(await getActiveTimeframes());
+  } catch (e: any) {
+    console.error("[KLINES] Initial timeframe discovery failed:", e?.message ?? e);
+  }
+
+  // How often to re-scan for newly added timeframes (default: every 5 minutes).
+  const tfRefreshMs = Math.max(60_000, Number(process.env.KLINE_TF_REFRESH_SECONDS ?? 300) * 1000);
+  let lastTfRefresh = Date.now();
+
+  // ── Main loop ──────────────────────────────────────────────────────────────
   while (true) {
     await tick();
+
+    // Periodically re-discover timeframes so a newly deployed strategy that uses
+    // a new interval (e.g. a user adds a 4h block for the first time) gets a
+    // KlineManager started without requiring a runner restart.
+    if (Date.now() - lastTfRefresh >= tfRefreshMs) {
+      lastTfRefresh = Date.now();
+      try {
+        ensureManagers(await getActiveTimeframes());
+      } catch (e: any) {
+        console.error("[KLINES] Timeframe refresh failed:", e?.message ?? e);
+      }
+    }
+
     await new Promise((r) => setTimeout(r, 2000));
   }
 }
