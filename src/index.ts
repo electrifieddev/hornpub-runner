@@ -5,6 +5,7 @@ import { KlineCache } from "./klines/KlineCache.js";
 import createIndicators from "./indicators/createIndicators.js";
 import { runInSandbox } from "./engine/Sandbox.js";
 import { PaperBroker } from "./broker/PaperBroker.js";
+import { LiveBroker } from "./broker/LiveBroker.js";
 
 // ─── Settings helpers ────────────────────────────────────────────────────────
 
@@ -134,6 +135,8 @@ type Project = {
   owner_id: string; // projects table uses owner_id
   generated_js: string | null; // you chose generated_js
   interval_seconds: number;
+  mode?: string; // "paper" | "live"
+  settings_json?: Record<string, any>; // may carry binance_api_key / binance_api_secret
 };
 
 async function log(
@@ -157,10 +160,13 @@ async function log(
 }
 
 async function runProject(p: Project) {
+  // Determine execution mode: "live" if project has binance keys, else "paper"
+  const projectMode = p.mode === "live" ? "live" : "paper";
+
   // Create run record (project_runs expects user_id)
   const { data: runRow, error: runErr } = await supabase
     .from("project_runs")
-    .insert({ project_id: p.id, user_id: p.owner_id, mode: "paper", status: "running" })
+    .insert({ project_id: p.id, user_id: p.owner_id, mode: projectMode, status: "running" })
     .select("id")
     .single();
 
@@ -182,7 +188,10 @@ async function runProject(p: Project) {
     if (projErr) throw projErr;
 
     // ── Load and enforce project settings ──────────────────────────────────
-    const settings: ProjectSettings = ((projRow as any)?.settings_json ?? {}) as ProjectSettings;
+    const settings: ProjectSettings & {
+      binance_api_key?: string;
+      binance_api_secret?: string;
+    } = ((projRow as any)?.settings_json ?? {}) as any;
     const advancedLogging = settings.advanced_logging === true;
 
     // Trade hours enforcement (UTC)
@@ -270,20 +279,56 @@ async function runProject(p: Project) {
       const context = { exchange: "binance", symbol, projectId: p.id };
       const indicators = createIndicators(klineCache, context);
 
-      const broker = new PaperBroker({
-        supabase,
-        cache: klineCache,
-        ctx: {
-          userId: p.owner_id,
-          projectId: p.id,
-          runId,
-          symbol,
-          exchange: "binance",
-          // Primary timeframe for mark price. PaperBroker.getMarkPrice() also
-          // falls back through 1m → 5m → 15m → 1h → 4h if this tf has no data.
-          tf: primaryTf,
-        },
-      });
+      const brokerCtxBase = {
+        userId: p.owner_id,
+        projectId: p.id,
+        runId,
+        symbol,
+        exchange: "binance",
+        // Primary timeframe for mark price. Broker.getMarkPrice() also
+        // falls back through 1m → 5m → 15m → 1h → 4h if this tf has no data.
+        tf: primaryTf,
+      };
+
+      // ── Resolve Binance API keys for live mode ────────────────────────────
+      // Keys can come from project settings_json (per-project) or env vars (global fallback).
+      const binanceApiKey = settings.binance_api_key ?? process.env.BINANCE_API_KEY ?? "";
+      const binanceApiSecret = settings.binance_api_secret ?? process.env.BINANCE_API_SECRET ?? "";
+      const isLiveMode = projectMode === "live";
+
+      let broker: PaperBroker | LiveBroker;
+
+      if (isLiveMode) {
+        if (!binanceApiKey || !binanceApiSecret) {
+          await log(p.id, p.owner_id, "error",
+            `Live mode requires BINANCE_API_KEY and BINANCE_API_SECRET for ${symbol} — falling back to paper mode.`,
+            { run_id: runId, symbol }
+          );
+          broker = new PaperBroker({ supabase, cache: klineCache, ctx: brokerCtxBase });
+        } else {
+          const liveBroker = new LiveBroker({
+            supabase,
+            cache: klineCache,
+            ctx: { ...brokerCtxBase, apiKey: binanceApiKey, apiSecret: binanceApiSecret },
+          });
+          // Connectivity pre-flight check
+          const { ok, error: connErr } = await liveBroker.testConnectivity();
+          if (!ok) {
+            await log(p.id, p.owner_id, "error",
+              `Binance connectivity check failed for ${symbol}: ${connErr} — skipping symbol.`,
+              { run_id: runId, symbol }
+            );
+            symbolFailures++;
+            continue;
+          }
+          broker = liveBroker;
+          if (advancedLogging) {
+            await log(p.id, p.owner_id, "info", `[LIVE] Binance connectivity OK for ${symbol}`, { run_id: runId, symbol });
+          }
+        }
+      } else {
+        broker = new PaperBroker({ supabase, cache: klineCache, ctx: brokerCtxBase });
+      }
 
       // Broker surface exposed to user strategies.
       // Supports BOTH:
