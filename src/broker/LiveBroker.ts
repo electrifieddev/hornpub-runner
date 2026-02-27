@@ -469,10 +469,12 @@ export class LiveBroker {
 
       const totalQtyMerged = existingQty + effectiveQty;
       const avgEntry = (existingQty * existingEntry + effectiveQty * fillPrice) / totalQtyMerged;
+      // Accumulate this buy's fee into realized_pnl so it is netted out on close.
+      const prevPositionRealized = Number(existing.realized_pnl ?? 0) || 0;
 
       const { error } = await this.sb
         .from("project_positions")
-        .update({ qty: totalQtyMerged, entry_price: avgEntry })
+        .update({ qty: totalQtyMerged, entry_price: avgEntry, realized_pnl: prevPositionRealized - feeUsd })
         .eq("id", existing.id);
       if (error) throw error;
 
@@ -524,7 +526,9 @@ export class LiveBroker {
         entry_time: now,
         exit_price: null,
         exit_time: null,
-        realized_pnl: null,
+        // Store buy fee as a negative starting realized_pnl so it is automatically
+        // included when the position is closed (sell path reads prevRealized).
+        realized_pnl: -feeUsd,
       })
       .select("id")
       .maybeSingle();
@@ -540,9 +544,10 @@ export class LiveBroker {
           if (Number.isFinite(existingQty) && existingQty > 0 && Number.isFinite(existingEntry)) {
             const totalQtyMerged = existingQty + effectiveQty;
             const avgEntry = (existingQty * existingEntry + effectiveQty * fillPrice) / totalQtyMerged;
+            const prevRaceRealized = Number(racePos.realized_pnl ?? 0) || 0;
             const { error: mergeErr } = await this.sb
               .from("project_positions")
-              .update({ qty: totalQtyMerged, entry_price: avgEntry })
+              .update({ qty: totalQtyMerged, entry_price: avgEntry, realized_pnl: prevRaceRealized - feeUsd })
               .eq("id", racePos.id);
             if (mergeErr) throw mergeErr;
             await this.insertTrade({
@@ -677,6 +682,10 @@ export class LiveBroker {
 
     const remainingQty = posQty - filledQty;
 
+    // prevRealized holds accumulated buy fees stored as negatives (see buy path).
+    // Adding it here ensures the full close PnL is net of both buy AND sell fees.
+    const prevRealized = Number(pos.realized_pnl ?? 0) || 0;
+
     if (remainingQty <= 1e-8) {
       // Full close
       const { error } = await this.sb
@@ -685,7 +694,7 @@ export class LiveBroker {
           status: "closed",
           exit_price: fillPrice,
           exit_time: now,
-          realized_pnl: realized,
+          realized_pnl: prevRealized + realized,
         })
         .eq("id", pos.id);
       if (error) throw error;
@@ -725,7 +734,6 @@ export class LiveBroker {
     }
 
     // Partial close
-    const prevRealized = Number(pos.realized_pnl ?? 0) || 0;
     const { error } = await this.sb
       .from("project_positions")
       .update({
