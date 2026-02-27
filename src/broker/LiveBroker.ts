@@ -453,7 +453,7 @@ export class LiveBroker {
     const feeUsd = feeAsset === "USDT"
       ? totalFee
       : feeAsset === "BNB"
-      ? totalFee * (this.getMarkPrice() ?? 0) * 0 // BNB fee — we don't have BNB price, store raw
+      ? totalFee // BNB fee — no BNB/USD price available, store raw BNB amount
       : totalFee * fillPrice; // Base asset fee: qty * price
 
     const existing = await this.getOpenPosition();

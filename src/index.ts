@@ -11,6 +11,8 @@ import { LiveBroker } from "./broker/LiveBroker.js";
 
 type TradeHours = { start: string; end: string };
 type ProjectSettings = {
+  mode?: string; // "paper" | "live" — stored inside settings_json
+  wallet_id?: string; // UUID reference to the wallets table
   trade_hours?: TradeHours;
   disable_weekends?: boolean;
   max_trades_per_day?: number;
@@ -164,6 +166,8 @@ async function runProject(p: Project) {
   const projectMode = p.mode === "live" ? "live" : "paper";
 
   // Create run record (project_runs expects user_id)
+  // Insert the run row with a temporary mode; we'll patch it after reading settings_json.
+  // projectMode from the RPC may be wrong if the RPC doesn't SELECT mode.
   const { data: runRow, error: runErr } = await supabase
     .from("project_runs")
     .insert({ project_id: p.id, user_id: p.owner_id, mode: projectMode, status: "running" })
@@ -192,6 +196,14 @@ async function runProject(p: Project) {
       binance_api_key?: string;
       binance_api_secret?: string;
     } = ((projRow as any)?.settings_json ?? {}) as any;
+
+    // mode lives inside settings_json (e.g. {"mode":"live",...}), NOT as a
+    // separate top-level column. p.mode from claim_due_projects may be undefined
+    // if that RPC doesn't select it, so settings.mode is the authoritative source.
+    const resolvedMode = (settings.mode ?? p.mode) === "live" ? "live" : "paper";
+
+    // Patch the run row with the correct mode now that we've read it from settings_json.
+    await supabase.from("project_runs").update({ mode: resolvedMode }).eq("id", runId);
     const advancedLogging = settings.advanced_logging === true;
 
     // Trade hours enforcement (UTC)
@@ -291,10 +303,33 @@ async function runProject(p: Project) {
       };
 
       // ── Resolve Binance API keys for live mode ────────────────────────────
-      // Keys can come from project settings_json (per-project) or env vars (global fallback).
-      const binanceApiKey = settings.binance_api_key ?? process.env.BINANCE_API_KEY ?? "";
-      const binanceApiSecret = settings.binance_api_secret ?? process.env.BINANCE_API_SECRET ?? "";
-      const isLiveMode = projectMode === "live";
+      // Keys live in the wallets table: external_key = API key, address = API secret.
+      // Fall back to direct settings_json keys or env vars if no wallet is linked.
+      let binanceApiKey = settings.binance_api_key ?? process.env.BINANCE_API_KEY ?? "";
+      let binanceApiSecret = settings.binance_api_secret ?? process.env.BINANCE_API_SECRET ?? "";
+
+      if (settings.wallet_id) {
+        const { data: wallet, error: walletErr } = await supabase
+          .from("wallets")
+          .select("external_key, address")
+          .eq("id", settings.wallet_id)
+          .eq("owner_id", p.owner_id)
+          .maybeSingle();
+
+        if (walletErr || !wallet) {
+          await log(p.id, p.owner_id, "error",
+            walletErr
+              ? `Failed to load wallet ${settings.wallet_id}: ${walletErr.message}`
+              : `Wallet ${settings.wallet_id} not found or not owned by this user`,
+            { run_id: runId, symbol }
+          );
+        } else {
+          binanceApiKey = wallet.external_key ?? binanceApiKey;
+          binanceApiSecret = wallet.address ?? binanceApiSecret;
+        }
+      }
+
+      const isLiveMode = resolvedMode === "live";
 
       let broker: PaperBroker | LiveBroker;
 
