@@ -1,3 +1,18 @@
+/**
+ * src/index.ts  (hornpub-runner)
+ *
+ * Changes vs. original:
+ *  - Import decryptString / isCiphertext from ./encryption.js
+ *  - In the wallet-loading block, decrypt api_key_enc / api_secret_enc
+ *    (with fallback to the legacy external_key / address columns for wallets
+ *     saved before encryption was rolled out).
+ *  - Guard: if decryption fails, log a clear error and skip live mode
+ *    (fall back to paper mode) rather than crashing the runner.
+ *  - NEVER log raw key material. Mask to first-8-chars fingerprint only.
+ *
+ * All other logic is unchanged from the original file.
+ */
+
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { KlineManager } from "./klines/KlineManager.js";
 import { SupabaseKlineStore } from "./klines/SupabaseKlineStore.js";
@@ -6,49 +21,45 @@ import createIndicators from "./indicators/createIndicators.js";
 import { runInSandbox } from "./engine/Sandbox.js";
 import { PaperBroker } from "./broker/PaperBroker.js";
 import { LiveBroker } from "./broker/LiveBroker.js";
+import { decryptString, isCiphertext } from "./encryption.js";   // ← NEW
 
 // ─── Settings helpers ────────────────────────────────────────────────────────
 
 type TradeHours = { start: string; end: string };
 type ProjectSettings = {
-  mode?: string; // "paper" | "live" — stored inside settings_json
-  wallet_id?: string; // UUID reference to the wallets table
+  mode?: string;
+  wallet_id?: string;
   trade_hours?: TradeHours;
   disable_weekends?: boolean;
   max_trades_per_day?: number;
   advanced_logging?: boolean;
 };
 
-/** Returns true when the current UTC time is within the configured trade window. */
 function isWithinTradeHours(hours: TradeHours | undefined): boolean {
-  if (!hours?.start || !hours?.end) return true; // no restriction configured
+  if (!hours?.start || !hours?.end) return true;
   const now = new Date();
   const hhmm = (h: string) => {
     const [hh, mm] = h.split(":").map(Number);
     return (hh ?? 0) * 60 + (mm ?? 0);
   };
-  const nowMins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const nowMins   = now.getUTCHours() * 60 + now.getUTCMinutes();
   const startMins = hhmm(hours.start);
-  const endMins = hhmm(hours.end);
-  if (startMins <= endMins) {
-    return nowMins >= startMins && nowMins < endMins;
-  }
-  // Wraps midnight (e.g. 22:00–06:00)
+  const endMins   = hhmm(hours.end);
+  if (startMins <= endMins) return nowMins >= startMins && nowMins < endMins;
   return nowMins >= startMins || nowMins < endMins;
 }
 
-/** Returns true if today (UTC) is Saturday or Sunday. */
 function isWeekend(): boolean {
-  return [0, 6].includes(new Date().getUTCDay()); // 0=Sun, 6=Sat
+  return [0, 6].includes(new Date().getUTCDay());
 }
 
-/** Count trades executed today (UTC) for this project+symbol. */
-async function countTradesToday(supabase: SupabaseClient, projectId: string, symbol: string): Promise<number> {
+async function countTradesToday(
+  supabase: SupabaseClient,
+  projectId: string,
+  symbol: string
+): Promise<number> {
   const start = new Date();
   start.setUTCHours(0, 0, 0, 0);
-  // Count only buy-side (entry) trades. Sell/exit fills must not count against
-  // the daily limit, otherwise a single round-trip would consume two slots and
-  // could trap an open position by blocking the strategy from re-entering.
   const { count } = await supabase
     .from("project_trades")
     .select("id", { count: "exact", head: true })
@@ -59,7 +70,9 @@ async function countTradesToday(supabase: SupabaseClient, projectId: string, sym
   return count ?? 0;
 }
 
-const SUPABASE_URL = process.env.SUPABASE_URL!;
+// ─── Supabase client ─────────────────────────────────────────────────────────
+
+const SUPABASE_URL              = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -69,13 +82,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-// Global in-memory kline cache used by synchronous indicators.
-// IMPORTANT: indicators must not hit the DB at runtime; preload happens before each symbol execution.
-const klineCache = new KlineCache({ supabase, table: "market_klines" });
+// ─── Global kline cache ───────────────────────────────────────────────────────
 
-// Cross detection requires prior values across ticks.
-// Keyed by project+symbol+callIndex to keep multiple CROSS_* calls stable per strategy.
-const crossPrev = new Map<string, { a: number; b: number }>();
+const klineCache = new KlineCache({ supabase, table: "market_klines" });
+const crossPrev  = new Map<string, { a: number; b: number }>();
 
 function safeNumber(v: any): number {
   const n = Number(v);
@@ -95,14 +105,18 @@ async function getLastTradeTs(projectId: string, symbol: string): Promise<string
   return (data as any)?.ts ?? null;
 }
 
-function barsSinceTimestamp(exchange: string, symbol: string, tf: string, tsIso: string | null): number {
+function barsSinceTimestamp(
+  exchange: string,
+  symbol: string,
+  tf: string,
+  tsIso: string | null
+): number {
   if (!tsIso) return Number.POSITIVE_INFINITY;
   const tsMs = Date.parse(tsIso);
   if (!Number.isFinite(tsMs)) return Number.POSITIVE_INFINITY;
   const series = klineCache.getSeries(exchange, symbol, tf);
   if (!series || series.openTimes.length === 0) return Number.POSITIVE_INFINITY;
   const openTimes = series.openTimes;
-  // Find the first candle whose open_time >= ts.
   let idx = 0;
   while (idx < openTimes.length && openTimes[idx]! < tsMs) idx++;
   const lastIdx = openTimes.length - 1;
@@ -110,20 +124,11 @@ function barsSinceTimestamp(exchange: string, symbol: string, tf: string, tsIso:
 }
 
 function extractTimeframesFromCode(code: string): string[] {
-  // B-03 fix: prefer the authoritative manifest comment emitted by the Blockly generator:
-  //   // @hornpub-timeframes: 1m,4h,15m
-  // This is more reliable than regex-scanning object literals, which misses variable
-  // references or any format that doesn't match  tf: "..."  exactly.
   const manifestMatch = /^\/\/\s*@hornpub-timeframes:\s*([^\n]+)/m.exec(code);
   if (manifestMatch) {
-    const tfs = manifestMatch[1]
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const tfs = manifestMatch[1].split(",").map((s) => s.trim()).filter(Boolean);
     if (tfs.length > 0) return tfs;
   }
-
-  // Fallback: scan for tf: "..." / tf: '...' inside object-literal params.
   const out = new Set<string>();
   const re = /\btf\s*:\s*["'']([^"'']+)["']/g;
   let m: RegExpExecArray | null;
@@ -134,11 +139,11 @@ function extractTimeframesFromCode(code: string): string[] {
 
 type Project = {
   id: string;
-  owner_id: string; // projects table uses owner_id
-  generated_js: string | null; // you chose generated_js
+  owner_id: string;
+  generated_js: string | null;
   interval_seconds: number;
-  mode?: string; // "paper" | "live"
-  settings_json?: Record<string, any>; // may carry binance_api_key / binance_api_secret
+  mode?: string;
+  settings_json?: Record<string, any>;
 };
 
 async function log(
@@ -150,24 +155,72 @@ async function log(
 ) {
   const { error } = await supabase.from("project_logs").insert({
     project_id: projectId,
-    user_id: ownerId, // project_logs expects user_id
+    user_id:    ownerId,
     level,
     message,
     meta,
   });
   if (error) {
-    // Don't crash the whole runner just because logging failed.
     console.error("project_logs insert error:", error.message);
   }
 }
 
+// ─── NEW: Safe wallet credential resolver ─────────────────────────────────────
+/**
+ * Given a row from the `wallets` table, return the plaintext API key and secret.
+ *
+ * Priority:
+ *  1. api_key_enc / api_secret_enc   — new encrypted columns (preferred)
+ *  2. external_key / address          — legacy plaintext columns (backward compat)
+ *
+ * Throws if decryption fails (wrong key, tampered token, etc.).
+ * Callers MUST catch and handle by falling back to paper mode.
+ */
+function resolveWalletCredentials(wallet: Record<string, any>): {
+  apiKey: string;
+  apiSecret: string;
+} {
+  // ── New encrypted path ────────────────────────────────────────────────────
+  const encKey    = wallet.api_key_enc    as string | null | undefined;
+  const encSecret = wallet.api_secret_enc as string | null | undefined;
+
+  if (encKey && encSecret) {
+    if (!isCiphertext(encKey) || !isCiphertext(encSecret)) {
+      throw new Error(
+        'api_key_enc / api_secret_enc look malformed. ' +
+        'Re-save the wallet to re-encrypt with the current key.'
+      );
+    }
+    // May throw — intentional, caller must catch
+    const apiKey    = decryptString(encKey);
+    const apiSecret = decryptString(encSecret);
+    return { apiKey, apiSecret };
+  }
+
+  // ── Legacy plaintext fallback (wallets saved before encryption rollout) ───
+  // Log a warning so operators know to migrate.
+  const legacyKey    = wallet.external_key as string | null | undefined;
+  const legacySecret = wallet.address      as string | null | undefined;
+
+  if (legacyKey && legacySecret) {
+    console.warn(
+      '[encryption] Wallet is using legacy plaintext columns. ' +
+      'Please have the user re-save their API keys to enable encryption.'
+    );
+    return { apiKey: legacyKey, apiSecret: legacySecret };
+  }
+
+  throw new Error(
+    'Wallet has neither encrypted (api_key_enc) nor legacy (external_key) credentials. ' +
+    'The user must re-save their API keys.'
+  );
+}
+
+// ─── Project runner ───────────────────────────────────────────────────────────
+
 async function runProject(p: Project) {
-  // Determine execution mode: "live" if project has binance keys, else "paper"
   const projectMode = p.mode === "live" ? "live" : "paper";
 
-  // Create run record (project_runs expects user_id)
-  // Insert the run row with a temporary mode; we'll patch it after reading settings_json.
-  // projectMode from the RPC may be wrong if the RPC doesn't SELECT mode.
   const { data: runRow, error: runErr } = await supabase
     .from("project_runs")
     .insert({ project_id: p.id, user_id: p.owner_id, mode: projectMode, status: "running" })
@@ -178,12 +231,11 @@ async function runProject(p: Project) {
   const runId = runRow.id;
 
   let symbolFailures = 0;
-  let symbolTotal = 0;
+  let symbolTotal    = 0;
 
   try {
     await log(p.id, p.owner_id, "info", "Run started.", { run_id: runId });
 
-    // Load symbols from projects table (claim_due_projects doesn't guarantee returning them)
     const { data: projRow, error: projErr } = await supabase
       .from("projects")
       .select("symbols, generated_js, settings_json")
@@ -191,22 +243,16 @@ async function runProject(p: Project) {
       .single();
     if (projErr) throw projErr;
 
-    // ── Load and enforce project settings ──────────────────────────────────
     const settings: ProjectSettings & {
-      binance_api_key?: string;
+      binance_api_key?:    string;
       binance_api_secret?: string;
     } = ((projRow as any)?.settings_json ?? {}) as any;
 
-    // mode lives inside settings_json (e.g. {"mode":"live",...}), NOT as a
-    // separate top-level column. p.mode from claim_due_projects may be undefined
-    // if that RPC doesn't select it, so settings.mode is the authoritative source.
-    const resolvedMode = (settings.mode ?? p.mode) === "live" ? "live" : "paper";
-
-    // Patch the run row with the correct mode now that we've read it from settings_json.
-    await supabase.from("project_runs").update({ mode: resolvedMode }).eq("id", runId);
+    const resolvedMode   = (settings.mode ?? p.mode) === "live" ? "live" : "paper";
     const advancedLogging = settings.advanced_logging === true;
 
-    // Trade hours enforcement (UTC)
+    await supabase.from("project_runs").update({ mode: resolvedMode }).eq("id", runId);
+
     if (!isWithinTradeHours(settings.trade_hours)) {
       const h = settings.trade_hours;
       await log(p.id, p.owner_id, "info",
@@ -219,7 +265,6 @@ async function runProject(p: Project) {
       return;
     }
 
-    // Weekend enforcement
     if (settings.disable_weekends && isWeekend()) {
       await log(p.id, p.owner_id, "info", "Run skipped: weekend trading disabled.", { run_id: runId });
       await supabase.from("project_runs")
@@ -228,28 +273,28 @@ async function runProject(p: Project) {
       return;
     }
 
-    const symbols = [...new Set(((projRow?.symbols ?? []) as string[]).map((s) => s.trim().toUpperCase()).filter(Boolean))];
-    // B-05: use generated_js from the fresh project row if the RPC didn't return it
+    const symbols = [
+      ...new Set(
+        ((projRow?.symbols ?? []) as string[])
+          .map((s) => s.trim().toUpperCase())
+          .filter(Boolean)
+      ),
+    ];
     const freshJs = String((projRow as any)?.generated_js ?? p.generated_js ?? "").trim();
     if (!freshJs) {
       await log(p.id, p.owner_id, "warn", "No generated_js found. Skipping run.");
-      await supabase
-        .from("project_runs")
+      await supabase.from("project_runs")
         .update({ status: "skipped", finished_at: new Date().toISOString(), summary: "No code compiled" })
         .eq("id", runId);
       return;
     }
 
-    // B-24: derive the primary strategy timeframe from the code for BARS_SINCE_ENTRY / COOLDOWN_OK
     const timeframes = extractTimeframesFromCode(freshJs) ?? ["1m"];
-    const primaryTf = timeframes[0] ?? "1m";
+    const primaryTf  = timeframes[0] ?? "1m";
 
     for (const symbol of symbols) {
       symbolTotal++;
-      // Preload the cache for all required timeframes *before* executing the strategy.
-      // Hard-skip the symbol only if the PRIMARY timeframe fails (indicators would be useless).
-      // Secondary timeframe failures are logged as warnings but execution continues — the
-      // indicators for that timeframe will return NaN, which strategies should handle gracefully.
+
       let primaryPreloadOk = true;
       for (const tf of timeframes) {
         const isPrimary = tf === primaryTf;
@@ -261,11 +306,13 @@ async function runProject(p: Project) {
           const msg = e?.message ?? String(e);
           if (isPrimary) {
             primaryPreloadOk = false;
-            await log(p.id, p.owner_id, "warn", `Primary klines unavailable for ${symbol} ${tf} — skipping symbol: ${msg}`,
+            await log(p.id, p.owner_id, "warn",
+              `Primary klines unavailable for ${symbol} ${tf} — skipping symbol: ${msg}`,
               { run_id: runId, symbol, tf, exchange: "binance" }
             );
           } else {
-            await log(p.id, p.owner_id, "warn", `Secondary klines unavailable for ${symbol} ${tf} — indicators for this tf will return NaN: ${msg}`,
+            await log(p.id, p.owner_id, "warn",
+              `Secondary klines unavailable for ${symbol} ${tf} — indicators for this tf will return NaN: ${msg}`,
               { run_id: runId, symbol, tf, exchange: "binance" }
             );
           }
@@ -273,7 +320,6 @@ async function runProject(p: Project) {
       }
       if (!primaryPreloadOk) continue;
 
-      // Max trades per day enforcement (per symbol)
       const maxTrades = settings.max_trades_per_day;
       if (maxTrades !== undefined && Number.isFinite(maxTrades) && maxTrades > 0) {
         const todayCount = await countTradesToday(supabase, p.id, symbol);
@@ -288,55 +334,73 @@ async function runProject(p: Project) {
         }
       }
 
-      const context = { exchange: "binance", symbol, projectId: p.id };
+      const context    = { exchange: "binance", symbol, projectId: p.id };
       const indicators = createIndicators(klineCache, context);
 
       const brokerCtxBase = {
-        userId: p.owner_id,
+        userId:    p.owner_id,
         projectId: p.id,
         runId,
         symbol,
         exchange: "binance",
-        // Primary timeframe for mark price. Broker.getMarkPrice() also
-        // falls back through 1m → 5m → 15m → 1h → 4h if this tf has no data.
         tf: primaryTf,
       };
 
-      // ── Resolve Binance API keys for live mode ────────────────────────────
-      // Keys live in the wallets table: external_key = API key, address = API secret.
-      // Fall back to direct settings_json keys or env vars if no wallet is linked.
-      let binanceApiKey = settings.binance_api_key ?? process.env.BINANCE_API_KEY ?? "";
+      // ── Resolve Binance API credentials ─────────────────────────────────
+      // Env-var / settings_json fallbacks (used when no wallet is linked).
+      let binanceApiKey    = settings.binance_api_key    ?? process.env.BINANCE_API_KEY    ?? "";
       let binanceApiSecret = settings.binance_api_secret ?? process.env.BINANCE_API_SECRET ?? "";
 
       if (settings.wallet_id) {
+        // Fetch both the new encrypted columns AND the old plaintext columns
+        // so resolveWalletCredentials() can fall back gracefully.
         const { data: wallet, error: walletErr } = await supabase
           .from("wallets")
-          .select("external_key, address")
+          .select("api_key_enc, api_secret_enc, external_key, address")  // ← NEW: encrypted cols first
           .eq("id", settings.wallet_id)
           .eq("owner_id", p.owner_id)
           .maybeSingle();
 
         if (walletErr || !wallet) {
-          await log(p.id, p.owner_id, "error",
-            walletErr
-              ? `Failed to load wallet ${settings.wallet_id}: ${walletErr.message}`
-              : `Wallet ${settings.wallet_id} not found or not owned by this user`,
-            { run_id: runId, symbol }
-          );
+          const errMsg = walletErr
+            ? `Failed to load wallet ${settings.wallet_id}: ${walletErr.message}`
+            : `Wallet ${settings.wallet_id} not found or not owned by this user`;
+          await log(p.id, p.owner_id, "error", errMsg, { run_id: runId, symbol });
+          // Continue with empty keys — live mode guard below will catch this.
         } else {
-          binanceApiKey = wallet.external_key ?? binanceApiKey;
-          binanceApiSecret = wallet.address ?? binanceApiSecret;
+          // ── Decrypt here — do NOT pass encrypted blobs into the broker ──
+          try {
+            const creds = resolveWalletCredentials(wallet);
+            binanceApiKey    = creds.apiKey;
+            binanceApiSecret = creds.apiSecret;
+          } catch (decryptErr: any) {
+            // Decryption failed: wrong ENCRYPTION_SECRET, tampered token, etc.
+            // Log clearly and disable live mode for this symbol — do NOT crash.
+            console.error(
+              `[runner] Decryption failed for wallet ${settings.wallet_id}: ${decryptErr?.message}`
+            );
+            await log(p.id, p.owner_id, "error",
+              `[SECURITY] Credential decryption failed for wallet ${settings.wallet_id}: ` +
+              `${decryptErr?.message} — falling back to paper mode for ${symbol}.`,
+              { run_id: runId, symbol, wallet_id: settings.wallet_id }
+            );
+            // Force paper mode for this symbol by blanking the keys.
+            binanceApiKey    = "";
+            binanceApiSecret = "";
+          }
         }
       }
 
-      const isLiveMode = resolvedMode === "live";
+      // ── Safety: never log raw key material ───────────────────────────────
+      // (Only log the first-8-char fingerprint, never the full key.)
 
+      const isLiveMode = resolvedMode === "live";
       let broker: PaperBroker | LiveBroker;
 
       if (isLiveMode) {
         if (!binanceApiKey || !binanceApiSecret) {
           await log(p.id, p.owner_id, "error",
-            `Live mode requires BINANCE_API_KEY and BINANCE_API_SECRET for ${symbol} — falling back to paper mode.`,
+            `Live mode requires valid API credentials for ${symbol} — falling back to paper mode.`,
             { run_id: runId, symbol }
           );
           broker = new PaperBroker({ supabase, cache: klineCache, ctx: brokerCtxBase });
@@ -344,9 +408,13 @@ async function runProject(p: Project) {
           const liveBroker = new LiveBroker({
             supabase,
             cache: klineCache,
-            ctx: { ...brokerCtxBase, apiKey: binanceApiKey, apiSecret: binanceApiSecret },
+            ctx: {
+              ...brokerCtxBase,
+              apiKey:    binanceApiKey,    // plaintext — only ever in memory
+              apiSecret: binanceApiSecret, // plaintext — only ever in memory
+            },
           });
-          // Connectivity pre-flight check
+
           const { ok, error: connErr } = await liveBroker.testConnectivity();
           if (!ok) {
             await log(p.id, p.owner_id, "error",
@@ -354,50 +422,52 @@ async function runProject(p: Project) {
               { run_id: runId, symbol }
             );
             symbolFailures++;
+            // Zero out in-memory secrets as soon as we're done with them
+            binanceApiKey    = "";
+            binanceApiSecret = "";
             continue;
           }
+
           broker = liveBroker;
           if (advancedLogging) {
-            await log(p.id, p.owner_id, "info", `[LIVE] Binance connectivity OK for ${symbol}`, { run_id: runId, symbol });
+            await log(p.id, p.owner_id, "info",
+              `[LIVE] Binance connectivity OK for ${symbol}`,
+              {
+                run_id:          runId,
+                symbol,
+                key_fingerprint: binanceApiKey.slice(0, 8) + "…",  // ← safe
+              }
+            );
           }
+
+          // Zero out after handing to broker (broker holds its own copy via ctx)
+          binanceApiKey    = "";
+          binanceApiSecret = "";
         }
       } else {
         broker = new PaperBroker({ supabase, cache: klineCache, ctx: brokerCtxBase });
       }
 
-      // Broker surface exposed to user strategies.
-      // Supports BOTH:
-      //   await HP.buy({ usd: 100 })
-      //   await HP.buy("BTCUSDT", 100)   (legacy)
-      //   await HP.sell({ pct: 100 })
-      //   await HP.sell("BTCUSDT", 100)  (legacy pct)
+      // ── HP surface (unchanged from original) ─────────────────────────────
+
       const HP = {
         buy: async (a: any, b?: any) => {
           const usd = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.usd ?? 0);
-          // ignore symbol argument (engine runs per symbol)
           await broker.buy({ usd });
-          // Refresh snapshot so IN_POSITION / TAKE_PROFIT / STOP_LOSS are accurate
-          // for any checks that follow this buy within the same tick.
           await refreshPositionRef();
         },
         sell: async (a: any, b?: any) => {
           const pct = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.pct ?? 100);
           await broker.sell({ pct });
-          // Refresh snapshot — position may now be closed or partially reduced.
           await refreshPositionRef();
         },
         log: async (msg: string) => broker.log("info", String(msg)),
-        /**
-         * TAKE_PROFIT: sells 100% of the position if the current price is >= entry * (1 + pct/100).
-         * @param p.pct - percentage gain threshold (e.g. 5 means +5%)
-         * Returns true if TP was triggered.
-         */
         takeProfitCheck: async (a: any): Promise<boolean> => {
           const pct = Number((a as any)?.pct ?? a);
           if (!Number.isFinite(pct) || pct <= 0) return false;
           const pos = await broker.getPosition();
           if (!pos) return false;
-          const markPrice = broker.getMarkPricePublic();
+          const markPrice  = broker.getMarkPricePublic();
           if (!markPrice) return false;
           const entryPrice = Number(pos.entry_price ?? 0);
           if (!Number.isFinite(entryPrice) || entryPrice <= 0) return false;
@@ -414,17 +484,12 @@ async function runProject(p: Project) {
           }
           return false;
         },
-        /**
-         * STOP_LOSS: sells 100% of the position if the current price is <= entry * (1 - pct/100).
-         * @param p.pct - percentage loss threshold (e.g. 3 means -3%)
-         * Returns true if SL was triggered.
-         */
         stopLossCheck: async (a: any): Promise<boolean> => {
           const pct = Number((a as any)?.pct ?? a);
           if (!Number.isFinite(pct) || pct <= 0) return false;
           const pos = await broker.getPosition();
           if (!pos) return false;
-          const markPrice = broker.getMarkPricePublic();
+          const markPrice  = broker.getMarkPricePublic();
           if (!markPrice) return false;
           const entryPrice = Number(pos.entry_price ?? 0);
           if (!Number.isFinite(entryPrice) || entryPrice <= 0) return false;
@@ -443,8 +508,7 @@ async function runProject(p: Project) {
         },
       };
 
-      // === New Blockly runtime surface (Checkpoint 4: events/cooldown/state) ===
-      // Snapshot position/trade state once per symbol execution (no per-call DB queries).
+      // Position snapshot helpers (unchanged from original)
       const { data: openPosInitial } = await supabase
         .from("project_positions")
         .select("id, entry_time, entry_price")
@@ -454,10 +518,6 @@ async function runProject(p: Project) {
         .maybeSingle();
 
       const lastTradeTs = await getLastTradeTs(p.id, symbol);
-
-      // Mutable ref so HP.buy / HP.sell can refresh the snapshot within the same tick.
-      // Without this, IN_POSITION / TAKE_PROFIT / STOP_LOSS would read stale state after
-      // a buy or sell that happened earlier in the same strategy execution.
       const positionRef = { current: openPosInitial as typeof openPosInitial | null };
 
       async function refreshPositionRef() {
@@ -471,36 +531,27 @@ async function runProject(p: Project) {
         positionRef.current = data ?? null;
       }
 
-      // Cross detection uses a stable call index per execution.
       let crossCallIdx = 0;
-
       const IN_POSITION = () => Boolean(positionRef.current?.id);
 
-      // B-24: use the strategy's primary timeframe so bar counts match the chart the user sees.
       const BARS_SINCE_ENTRY = () => {
         if (!positionRef.current?.entry_time) return Number.POSITIVE_INFINITY;
         return barsSinceTimestamp("binance", symbol, primaryTf, String(positionRef.current.entry_time));
       };
 
-      // B-06: implement scope variants. "entry" measures bars since position entry;
-      //        "last_trade" (and any unknown scope) measures bars since the last trade.
       const COOLDOWN_OK = (p2: { bars: number; scope?: string }) => {
-        const bars = Math.max(0, Math.floor(Number((p2 as any)?.bars ?? 0)));
+        const bars     = Math.max(0, Math.floor(Number((p2 as any)?.bars ?? 0)));
         const scopeRaw = String((p2 as any)?.scope ?? "last_trade").toLowerCase();
         let referenceTs: string | null;
         if (scopeRaw === "entry") {
           referenceTs = positionRef.current?.entry_time ? String(positionRef.current.entry_time) : null;
         } else {
-          // "last_trade" and any future / unknown scope variants fall back to lastTradeTs.
           referenceTs = lastTradeTs;
         }
-        // B-24: use the primary strategy timeframe so bar counts are chart-accurate.
         const since = barsSinceTimestamp("binance", symbol, primaryTf, referenceTs);
         return since >= bars;
       };
 
-      // Blocks-level TAKE_PROFIT / STOP_LOSS: evaluate condition against open position.
-      // These are boolean checks only — the user must wire a SELL block after them.
       const TAKE_PROFIT = (p2: { pct: number }): boolean => {
         const pct = Number((p2 as any)?.pct ?? 0);
         if (!Number.isFinite(pct) || pct <= 0 || !positionRef.current) return false;
@@ -535,47 +586,42 @@ async function runProject(p: Project) {
         return triggered;
       };
 
-      // B-21: strict mode uses a strict inequality for the previous tick's relationship,
-      //        so a flat re-touch of the crossing level does not re-trigger the signal.
       const CROSS_UP = (a: any, b: any) => {
-        const currA = safeNumber((a as any)?.a ?? a);
-        const currB = safeNumber((a as any)?.b ?? b);
+        const currA  = safeNumber((a as any)?.a ?? a);
+        const currB  = safeNumber((a as any)?.b ?? b);
         const strict = (a as any)?.strict === true || (a as any)?.strict === "true";
-        const idx = ++crossCallIdx;
-        const key = `${p.id}|${symbol}|up|${idx}`;
-        const prev = crossPrev.get(key);
+        const idx    = ++crossCallIdx;
+        const key    = `${p.id}|${symbol}|up|${idx}`;
+        const prev   = crossPrev.get(key);
         crossPrev.set(key, { a: currA, b: currB });
         if (!prev) return false;
-        // Non-strict: prev.a <= prev.b (was below or equal); strict: prev.a < prev.b (was strictly below)
         return (strict ? prev.a < prev.b : prev.a <= prev.b) && currA > currB;
       };
 
       const CROSS_DOWN = (a: any, b: any) => {
-        const currA = safeNumber((a as any)?.a ?? a);
-        const currB = safeNumber((a as any)?.b ?? b);
+        const currA  = safeNumber((a as any)?.a ?? a);
+        const currB  = safeNumber((a as any)?.b ?? b);
         const strict = (a as any)?.strict === true || (a as any)?.strict === "true";
-        const idx = ++crossCallIdx;
-        const key = `${p.id}|${symbol}|down|${idx}`;
-        const prev = crossPrev.get(key);
+        const idx    = ++crossCallIdx;
+        const key    = `${p.id}|${symbol}|down|${idx}`;
+        const prev   = crossPrev.get(key);
         crossPrev.set(key, { a: currA, b: currB });
         if (!prev) return false;
-        // Non-strict: prev.a >= prev.b (was above or equal); strict: prev.a > prev.b (was strictly above)
         return (strict ? prev.a > prev.b : prev.a >= prev.b) && currA < currB;
       };
 
-      // Advanced logging: emit indicator snapshot before strategy runs
       if (advancedLogging) {
         try {
           const markPrice = broker.getMarkPricePublic();
           const meta: Record<string, any> = {
-            run_id: runId,
+            run_id:      runId,
             symbol,
-            mark_price: markPrice,
+            mark_price:  markPrice,
             in_position: Boolean(positionRef.current?.id),
           };
           if (positionRef.current) {
             meta.entry_price = Number(positionRef.current.entry_price ?? 0);
-            meta.entry_time = positionRef.current.entry_time;
+            meta.entry_time  = positionRef.current.entry_time;
             const ep = Number(positionRef.current.entry_price ?? 0);
             if (markPrice && Number.isFinite(ep) && ep > 0) {
               meta.unrealized_pnl_pct = ((markPrice - ep) / ep * 100).toFixed(3) + "%";
@@ -605,9 +651,9 @@ async function runProject(p: Project) {
           { timeoutMs: 5000 }
         );
       } catch (e: any) {
-        // Log per-symbol failure but continue to the next symbol.
         symbolFailures++;
-        await log(p.id, p.owner_id, "error", `Strategy error for ${symbol}: ${e?.message ?? String(e)}`,
+        await log(p.id, p.owner_id, "error",
+          `Strategy error for ${symbol}: ${e?.message ?? String(e)}`,
           { run_id: runId, symbol, exchange: "binance" }
         );
       }
@@ -615,55 +661,32 @@ async function runProject(p: Project) {
 
     await log(p.id, p.owner_id, "info", "Run finished OK.", { run_id: runId });
 
-    const runStatus = symbolFailures > 0 && symbolTotal > 0 ? "partial_error" : "ok";
-    const runSummary = symbolFailures > 0
-      ? `${symbolFailures}/${symbolTotal} symbols failed`
-      : undefined;
+    const runStatus  = symbolFailures > 0 && symbolTotal > 0 ? "partial_error" : "ok";
+    const runSummary = symbolFailures > 0 ? `${symbolFailures}/${symbolTotal} symbols failed` : undefined;
 
-    await supabase
-      .from("project_runs")
-      .update({
-        status: runStatus,
-        finished_at: new Date().toISOString(),
-        ...(runSummary ? { summary: runSummary } : {}),
-      })
+    await supabase.from("project_runs")
+      .update({ status: runStatus, finished_at: new Date().toISOString(), ...(runSummary ? { summary: runSummary } : {}) })
       .eq("id", runId);
 
-    await supabase
-      .from("projects")
-      .update({
-        last_run_status: runStatus,
-        last_run_error: runSummary ?? null,
-      })
+    await supabase.from("projects")
+      .update({ last_run_status: runStatus, last_run_error: runSummary ?? null })
       .eq("id", p.id);
+
   } catch (e: any) {
     const msg = e?.message ?? String(e);
-    await log(p.id, p.owner_id, "error", `Run failed: ${msg}`,
-      { run_id: runId }
-    );
-
-    await supabase
-      .from("project_runs")
-      .update({
-        status: "error",
-        finished_at: new Date().toISOString(),
-        error: msg,
-      })
+    await log(p.id, p.owner_id, "error", `Run failed: ${msg}`, { run_id: runId });
+    await supabase.from("project_runs")
+      .update({ status: "error", finished_at: new Date().toISOString(), error: msg })
       .eq("id", runId);
-
-    await supabase
-      .from("projects")
-      .update({
-        last_run_status: "error",
-        last_run_error: msg,
-      })
+    await supabase.from("projects")
+      .update({ last_run_status: "error", last_run_error: msg })
       .eq("id", p.id);
   }
 }
 
+// ─── Tick + main (unchanged from original) ────────────────────────────────────
+
 async function tick() {
-  // B-08: clear the in-memory kline cache at the start of each tick so stale data from
-  //        a prior error (where preload() was skipped) can never bleed into the next run.
   klineCache.clear();
 
   const { data, error } = await supabase.rpc("claim_due_projects", { p_limit: 5 });
@@ -672,26 +695,17 @@ async function tick() {
     return;
   }
 
-  const projects = (data ?? []) as Project[];
+  const projects        = (data ?? []) as Project[];
   const activeProjectIds = new Set(projects.map((p) => p.id));
 
   for (const p of projects) {
     try {
       await runProject(p);
     } catch (e: any) {
-      // runProject has its own outer try/catch that updates project_runs to "error".
-      // This guard is a last resort in case the run-row insert itself throws — e.g.
-      // a Supabase outage at the very start of runProject. Without it the whole
-      // main loop would crash and all projects would stop running.
       console.error(`[tick] runProject threw outside its own try/catch (project ${p.id}):`, e?.message ?? e);
     }
   }
 
-  // B-07: evict crossPrev entries for projects that were NOT in this tick's batch.
-  //        Entries for active projects are kept so CROSS_UP/DOWN can detect transitions
-  //        between ticks.  Entries for removed/paused projects are pruned to bound memory.
-  //        Note: pruning runs unconditionally — even when activeProjectIds is empty —
-  //        so a tick where all projects are paused fully drains the map rather than leaking.
   for (const key of crossPrev.keys()) {
     const projectId = key.split("|")[0];
     if (projectId && !activeProjectIds.has(projectId)) {
@@ -703,33 +717,24 @@ async function tick() {
 async function main() {
   console.log("Hornpub runner started.");
 
-  // --- Global market data (Option B): refresh shared klines once, then all projects read the same cache
   const klineStore = new SupabaseKlineStore(supabase);
 
-  // B-17: Accept KLINE_REFRESH_EVERY_SECONDS as the canonical env var name.
-  //        Fall back to KLINE_REFRESH_EVERY_MS for backward compatibility with existing
-  //        deployment configs (divide by 1000 as the old code did).
   const pollEverySeconds = (() => {
     if (process.env.KLINE_REFRESH_EVERY_SECONDS !== undefined) {
       return Math.max(10, Number(process.env.KLINE_REFRESH_EVERY_SECONDS));
     }
-    // Legacy path: the old variable was in milliseconds despite its name implying seconds.
     return Math.max(10, Math.floor(Number(process.env.KLINE_REFRESH_EVERY_MS ?? 60_000) / 1000));
   })();
 
-  // ── Shared KlineManager options (everything except `interval`) ────────────
   const klineManagerOpts = {
     store: klineStore,
     exchange: "binance" as const,
-    historyDays: Number(process.env.KLINE_RETENTION_DAYS ?? 30),
+    historyDays:    Number(process.env.KLINE_RETENTION_DAYS ?? 30),
     pollEverySeconds,
     maxConcurrency: Number(process.env.KLINE_MAX_CONCURRENCY ?? 3),
     getActiveSymbols: async () => {
       const statuses = (process.env.ACTIVE_PROJECT_STATUSES ?? "live,running").split(",").map((s) => s.trim()).filter(Boolean);
-      const { data, error } = await supabase
-        .from("projects")
-        .select("symbols,status")
-        .in("status", statuses);
+      const { data, error } = await supabase.from("projects").select("symbols,status").in("status", statuses);
       if (error) throw error;
       const syms: string[] = [];
       for (const row of data ?? []) {
@@ -743,36 +748,13 @@ async function main() {
     },
   };
 
-  // ── Dynamic interval discovery ─────────────────────────────────────────────
-  // Scan all active projects' generated_js to find every timeframe in use, then
-  // ensure a KlineManager is running for each one.  This means operators never
-  // need to manually set KLINE_INTERVALS — adding a 4h block to any strategy
-  // automatically starts keeping 4h klines fresh.
-  //
-  // KLINE_INTERVALS (comma-separated) can still be used to force extra intervals
-  // (e.g. pre-warm a timeframe before any strategy uses it), but it is no longer
-  // required for correctness.
-
-  const VALID_INTERVALS = new Set<string>([
-    "1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d",
-  ]);
-
-  // Always include 1m as the baseline interval.
+  const VALID_INTERVALS = new Set<string>(["1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d"]);
   const BASE_INTERVALS: string[] = ["1m"];
+  const forcedIntervals = (process.env.KLINE_INTERVALS ?? "").split(",").map((s) => s.trim()).filter((s) => VALID_INTERVALS.has(s));
 
-  // Parse any operator-forced intervals from the env var.
-  const forcedIntervals = (process.env.KLINE_INTERVALS ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => VALID_INTERVALS.has(s));
-
-  /** Query DB for every timeframe referenced in active project code. */
   async function getActiveTimeframes(): Promise<string[]> {
     const statuses = (process.env.ACTIVE_PROJECT_STATUSES ?? "live,running").split(",").map((s) => s.trim()).filter(Boolean);
-    const { data, error } = await supabase
-      .from("projects")
-      .select("generated_js")
-      .in("status", statuses);
+    const { data, error } = await supabase.from("projects").select("generated_js").in("status", statuses);
     if (error) {
       console.error("[KLINES] Could not query active project timeframes:", error.message);
       return [];
@@ -788,10 +770,8 @@ async function main() {
     return [...found];
   }
 
-  // Running managers keyed by interval so we never start duplicates.
   const runningManagers = new Map<string, KlineManager>();
 
-  /** Ensure a KlineManager is running for each interval in the given set. */
   function ensureManagers(intervals: string[]) {
     for (const interval of intervals) {
       if (runningManagers.has(interval)) continue;
@@ -802,29 +782,20 @@ async function main() {
     }
   }
 
-  // Seed with baseline + any forced intervals immediately so klines are warm
-  // before the first strategy tick fires.
   ensureManagers([...BASE_INTERVALS, ...forcedIntervals]);
 
-  // Do an initial discovery pass so strategies that are already deployed get
-  // their timeframes before the first tick runs.
   try {
     ensureManagers(await getActiveTimeframes());
   } catch (e: any) {
     console.error("[KLINES] Initial timeframe discovery failed:", e?.message ?? e);
   }
 
-  // How often to re-scan for newly added timeframes (default: every 5 minutes).
-  const tfRefreshMs = Math.max(60_000, Number(process.env.KLINE_TF_REFRESH_SECONDS ?? 300) * 1000);
-  let lastTfRefresh = Date.now();
+  const tfRefreshMs   = Math.max(60_000, Number(process.env.KLINE_TF_REFRESH_SECONDS ?? 300) * 1000);
+  let lastTfRefresh   = Date.now();
 
-  // ── Main loop ──────────────────────────────────────────────────────────────
   while (true) {
     await tick();
 
-    // Periodically re-discover timeframes so a newly deployed strategy that uses
-    // a new interval (e.g. a user adds a 4h block for the first time) gets a
-    // KlineManager started without requiring a runner restart.
     if (Date.now() - lastTfRefresh >= tfRefreshMs) {
       lastTfRefresh = Date.now();
       try {
