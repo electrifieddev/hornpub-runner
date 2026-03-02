@@ -511,7 +511,7 @@ async function runProject(p: Project) {
       // Position snapshot helpers (unchanged from original)
       const { data: openPosInitial } = await supabase
         .from("project_positions")
-        .select("id, entry_time, entry_price")
+        .select("id, entry_time, entry_price, qty")
         .eq("project_id", p.id)
         .eq("symbol", symbol)
         .eq("status", "open")
@@ -523,7 +523,7 @@ async function runProject(p: Project) {
       async function refreshPositionRef() {
         const { data } = await supabase
           .from("project_positions")
-          .select("id, entry_time, entry_price")
+          .select("id, entry_time, entry_price, qty")
           .eq("project_id", p.id)
           .eq("symbol", symbol)
           .eq("status", "open")
@@ -550,6 +550,15 @@ async function runProject(p: Project) {
         }
         const since = barsSinceTimestamp("binance", symbol, primaryTf, referenceTs);
         return since >= bars;
+      };
+
+      // Returns current USD value of holdings (qty × mark price), or NaN if no position.
+      const POSITION_VALUE = (): number => {
+        if (!positionRef.current) return Number.NaN;
+        const qty = Number(positionRef.current.qty ?? NaN);
+        const markPrice = broker.getMarkPricePublic();
+        if (!Number.isFinite(qty) || qty <= 0 || !markPrice) return Number.NaN;
+        return qty * markPrice;
       };
 
       const TAKE_PROFIT = (p2: { pct: number }): boolean => {
@@ -643,6 +652,7 @@ async function runProject(p: Project) {
             COOLDOWN_OK,
             IN_POSITION,
             BARS_SINCE_ENTRY,
+            POSITION_VALUE,
             TAKE_PROFIT,
             STOP_LOSS,
             HP,
