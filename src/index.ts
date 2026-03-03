@@ -511,117 +511,11 @@ async function runProject(p: Project) {
       // snapshotted at the moment HP.buy / HP.sell fires.
       const rowsCollector = new RowsCollector();
 
-      // ── Indicator wrappers — auto-record last computed value ─────────────
-      // We wrap each indicator so that whenever the strategy calls e.g.
-      // RSI({tf:"5m", length:14}) the returned value is also appended to
-      // rowsCollector.  The strategy is never changed; this is purely
-      // additive in the runner scope.
-      //
-      // For cross-indicators (EMA vs EMA comparisons) the individual EMA
-      // values are recorded; the comparison row is added by CROSS_UP /
-      // CROSS_DOWN wrappers below.
+      // ── HP.recordCondition feeds rows from generated strategy JS ─────────────
+      // The generated JS now calls HP.recordCondition({condition, value, rule, result})
+      // for every boolean condition block at evaluation time, so no indicator
+      // wrappers are needed here.
 
-      const trackedIndicators = {
-        ...indicators,
-
-        RSI: (p: Parameters<typeof indicators.RSI>[0]): number => {
-          const v = indicators.RSI(p);
-          const period = Math.max(1, Math.floor(Number(p.period ?? 14)));
-          if (Number.isFinite(v)) {
-            rowsCollector.push({
-              condition: `RSI (${period})`,
-              value:     v.toFixed(2),
-              rule:      "< 30 (oversold) or > 70 (overbought)",
-              result:    v < 30 || v > 70,
-            });
-          }
-          return v;
-        },
-
-        EMA: (p: Parameters<typeof indicators.EMA>[0]): number => {
-          const v = indicators.EMA(p);
-          const n = Math.max(1, Math.floor(Number(p.length)));
-          if (Number.isFinite(v)) {
-            rowsCollector.push({
-              condition: `EMA (${n})`,
-              value:     v.toFixed(2),
-              rule:      `EMA(${n}) computed`,
-              result:    true,
-            });
-          }
-          return v;
-        },
-
-        SMA: (p: Parameters<typeof indicators.SMA>[0]): number => {
-          const v = indicators.SMA(p);
-          const n = Math.max(1, Math.floor(Number(p.length)));
-          if (Number.isFinite(v)) {
-            rowsCollector.push({
-              condition: `SMA (${n})`,
-              value:     v.toFixed(2),
-              rule:      `SMA(${n}) computed`,
-              result:    true,
-            });
-          }
-          return v;
-        },
-
-        MACD: (p: Parameters<typeof indicators.MACD>[0]) => {
-          const v = indicators.MACD(p);
-          if (Number.isFinite(v?.histogram)) {
-            const bullish = v.histogram > 0;
-            rowsCollector.push({
-              condition: `MACD (${p.fast}/${p.slow}/${p.signal})`,
-              value:     `hist=${v.histogram.toFixed(4)}`,
-              rule:      "histogram > 0 (bullish)",
-              result:    bullish,
-            });
-          }
-          return v;
-        },
-
-        ATR: (p: Parameters<typeof indicators.ATR>[0]): number => {
-          const v = indicators.ATR(p);
-          const period = Math.max(1, Math.floor(Number(p.period ?? p.length ?? 14)));
-          if (Number.isFinite(v)) {
-            rowsCollector.push({
-              condition: `ATR (${period})`,
-              value:     v.toFixed(4),
-              rule:      `ATR(${period}) computed`,
-              result:    true,
-            });
-          }
-          return v;
-        },
-
-        BBANDS: (p: Parameters<typeof indicators.BBANDS>[0]) => {
-          const v = indicators.BBANDS(p);
-          if (Number.isFinite(v?.middle)) {
-            const markPrice = (broker as any).getMarkPricePublic?.() ?? 0;
-            const inBand    = Number.isFinite(markPrice) && markPrice >= v.lower && markPrice <= v.upper;
-            rowsCollector.push({
-              condition: `BBANDS (${p.length}, ${p.mult ?? (p as any).std ?? 2})`,
-              value:     `upper=${v.upper.toFixed(2)} lower=${v.lower.toFixed(2)}`,
-              rule:      "price within bands",
-              result:    inBand,
-            });
-          }
-          return v;
-        },
-
-        VOLUME: (p: Parameters<typeof indicators.VOLUME>[0]): number => {
-          const v = indicators.VOLUME(p);
-          if (Number.isFinite(v)) {
-            rowsCollector.push({
-              condition: "Volume",
-              value:     v.toFixed(2),
-              rule:      "volume computed",
-              result:    true,
-            });
-          }
-          return v;
-        },
-      };
 
       const brokerCtxBase = {
         userId:    p.owner_id,
@@ -804,15 +698,6 @@ async function runProject(p: Project) {
         crossPrev.set(key, { a: currA, b: currB });
         if (!prev) return false;
         const crossed = (strict ? prev.a < prev.b : prev.a <= prev.b) && currA > currB;
-        // Record an EMA cross row if both values look like prices
-        if (Number.isFinite(currA) && Number.isFinite(currB)) {
-          rowsCollector.push({
-            condition: `Cross Up (A vs B)`,
-            value:     `${currA.toFixed(2)} > ${currB.toFixed(2)}`,
-            rule:      "A crossed above B",
-            result:    crossed,
-          });
-        }
         return crossed;
       };
 
@@ -826,14 +711,6 @@ async function runProject(p: Project) {
         crossPrev.set(key, { a: currA, b: currB });
         if (!prev) return false;
         const crossed = (strict ? prev.a > prev.b : prev.a >= prev.b) && currA < currB;
-        if (Number.isFinite(currA) && Number.isFinite(currB)) {
-          rowsCollector.push({
-            condition: `Cross Down (A vs B)`,
-            value:     `${currA.toFixed(2)} < ${currB.toFixed(2)}`,
-            rule:      "A crossed below B",
-            result:    crossed,
-          });
-        }
         return crossed;
       };
 
@@ -873,6 +750,14 @@ async function runProject(p: Project) {
       //   Both are captured synchronously before any async work begins.
 
       const HP = {
+        // recordCondition: called by generated strategy JS for every boolean
+        // condition block.  The block generator emits an IIFE that evaluates
+        // the real indicator value, computes the result, then calls this so
+        // the runner has accurate condition data at exactly decision-time.
+        recordCondition: (row: ConditionRow): void => {
+          rowsCollector.push(row);
+        },
+
         buy: async (a: any, b?: any) => {
           const usd = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.usd ?? 0);
 
@@ -1061,7 +946,7 @@ async function runProject(p: Project) {
         await runInSandbox(
           freshJs,
           {
-            ...trackedIndicators,
+            ...indicators,
             CROSS_UP,
             CROSS_DOWN,
             COOLDOWN_OK,
