@@ -28,6 +28,43 @@ import { PaperBroker }        from "./broker/PaperBroker.js";
 import { LiveBroker }         from "./broker/LiveBroker.js";
 import { decryptString, isCiphertext } from "./encryption.js";
 
+// ─── Condition row types ──────────────────────────────────────────────────────
+
+/**
+ * A single evaluated condition row stored inside detail_json.rows[].
+ * Matches the table format shown in the trade detail modal:
+ *   Condition | Value | Rule | Result
+ */
+export type ConditionRow = {
+  condition: string;
+  value:     string;
+  rule:      string;
+  result:    boolean;
+};
+
+/**
+ * Per-trade accumulator.  Instantiate one at the start of each symbol run,
+ * push rows as conditions are evaluated, then snapshot when HP.buy/sell fires.
+ *
+ * Rows are keyed by condition label so that repeated indicator calls (e.g.
+ * EMA called multiple times) overwrite rather than duplicate.
+ */
+class RowsCollector {
+  private _map = new Map<string, ConditionRow>();
+
+  push(row: ConditionRow): void {
+    this._map.set(row.condition, row);
+  }
+
+  snapshot(): ConditionRow[] {
+    return [...this._map.values()];
+  }
+
+  clear(): void {
+    this._map.clear();
+  }
+}
+
 // ─── Settings helpers ─────────────────────────────────────────────────────────
 
 type TradeHours      = { start: string; end: string };
@@ -233,9 +270,14 @@ async function insertTriggerLog(opts: {
   priceAtTrigger:  number;
   positionBefore:  Record<string, any> | null;
   runId:           string;
+  rows:            ConditionRow[];
 }): Promise<string | null> {
-  const { projectId, ownerId, side, symbol, interval, priceAtTrigger, positionBefore, runId } = opts;
-  const primaryReason = side === "BUY" ? "Strategy BUY signal" : "Strategy SELL signal";
+  const { projectId, ownerId, side, symbol, interval, priceAtTrigger, positionBefore, runId, rows } = opts;
+
+  const allPassed = rows.length === 0 || rows.every((r) => r.result);
+  const summary   = allPassed
+    ? `All entry conditions met. Executing ${side}.`
+    : `Some conditions failed. Executing ${side} anyway.`;
 
   const detail_json: Record<string, any> = {
     kind:             "trade_trigger",
@@ -243,20 +285,18 @@ async function insertTriggerLog(opts: {
     symbol,
     interval,
     price_at_trigger: priceAtTrigger,
-    trigger: {
-      primary_reason: primaryReason,
-      // conditions array: strategies may extend this in future; empty for generic strategies
-      conditions: [],
-      context: {
-        position_before: positionBefore
-          ? {
-              qty:         positionBefore.qty         ?? null,
-              entry_price: positionBefore.entry_price ?? null,
-              entry_time:  positionBefore.entry_time  ?? null,
-              position_id: positionBefore.id          ?? null,
-            }
-          : null,
-      },
+    summary,
+    rows,
+    // Keep legacy context block for backwards compat
+    context: {
+      position_before: positionBefore
+        ? {
+            qty:         positionBefore.qty         ?? null,
+            entry_price: positionBefore.entry_price ?? null,
+            entry_time:  positionBefore.entry_time  ?? null,
+            position_id: positionBefore.id          ?? null,
+          }
+        : null,
     },
   };
 
@@ -264,7 +304,7 @@ async function insertTriggerLog(opts: {
     projectId,
     ownerId,
     "info",
-    `TRADE_TRIGGER ${side} ${symbol} (${primaryReason})`,
+    `TRADE_TRIGGER ${side} ${symbol} @ ${priceAtTrigger}`,
     { run_id: runId, symbol, exchange: "binance" },
     detail_json,
   );
@@ -466,6 +506,123 @@ async function runProject(p: Project) {
       const context    = { exchange: "binance", symbol, projectId: p.id };
       const indicators = createIndicators(klineCache, context);
 
+      // ── Per-symbol condition rows collector ──────────────────────────────
+      // Rows are accumulated as the strategy evaluates conditions, then
+      // snapshotted at the moment HP.buy / HP.sell fires.
+      const rowsCollector = new RowsCollector();
+
+      // ── Indicator wrappers — auto-record last computed value ─────────────
+      // We wrap each indicator so that whenever the strategy calls e.g.
+      // RSI({tf:"5m", length:14}) the returned value is also appended to
+      // rowsCollector.  The strategy is never changed; this is purely
+      // additive in the runner scope.
+      //
+      // For cross-indicators (EMA vs EMA comparisons) the individual EMA
+      // values are recorded; the comparison row is added by CROSS_UP /
+      // CROSS_DOWN wrappers below.
+
+      const trackedIndicators = {
+        ...indicators,
+
+        RSI: (p: Parameters<typeof indicators.RSI>[0]): number => {
+          const v = indicators.RSI(p);
+          const period = Math.max(1, Math.floor(Number(p.period ?? 14)));
+          if (Number.isFinite(v)) {
+            rowsCollector.push({
+              condition: `RSI (${period})`,
+              value:     v.toFixed(2),
+              rule:      "< 30 (oversold) or > 70 (overbought)",
+              result:    v < 30 || v > 70,
+            });
+          }
+          return v;
+        },
+
+        EMA: (p: Parameters<typeof indicators.EMA>[0]): number => {
+          const v = indicators.EMA(p);
+          const n = Math.max(1, Math.floor(Number(p.length)));
+          if (Number.isFinite(v)) {
+            rowsCollector.push({
+              condition: `EMA (${n})`,
+              value:     v.toFixed(2),
+              rule:      `EMA(${n}) computed`,
+              result:    true,
+            });
+          }
+          return v;
+        },
+
+        SMA: (p: Parameters<typeof indicators.SMA>[0]): number => {
+          const v = indicators.SMA(p);
+          const n = Math.max(1, Math.floor(Number(p.length)));
+          if (Number.isFinite(v)) {
+            rowsCollector.push({
+              condition: `SMA (${n})`,
+              value:     v.toFixed(2),
+              rule:      `SMA(${n}) computed`,
+              result:    true,
+            });
+          }
+          return v;
+        },
+
+        MACD: (p: Parameters<typeof indicators.MACD>[0]) => {
+          const v = indicators.MACD(p);
+          if (Number.isFinite(v?.histogram)) {
+            const bullish = v.histogram > 0;
+            rowsCollector.push({
+              condition: `MACD (${p.fast}/${p.slow}/${p.signal})`,
+              value:     `hist=${v.histogram.toFixed(4)}`,
+              rule:      "histogram > 0 (bullish)",
+              result:    bullish,
+            });
+          }
+          return v;
+        },
+
+        ATR: (p: Parameters<typeof indicators.ATR>[0]): number => {
+          const v = indicators.ATR(p);
+          const period = Math.max(1, Math.floor(Number(p.period ?? p.length ?? 14)));
+          if (Number.isFinite(v)) {
+            rowsCollector.push({
+              condition: `ATR (${period})`,
+              value:     v.toFixed(4),
+              rule:      `ATR(${period}) computed`,
+              result:    true,
+            });
+          }
+          return v;
+        },
+
+        BBANDS: (p: Parameters<typeof indicators.BBANDS>[0]) => {
+          const v = indicators.BBANDS(p);
+          if (Number.isFinite(v?.middle)) {
+            const markPrice = (broker as any).getMarkPricePublic?.() ?? 0;
+            const inBand    = Number.isFinite(markPrice) && markPrice >= v.lower && markPrice <= v.upper;
+            rowsCollector.push({
+              condition: `BBANDS (${p.length}, ${p.mult ?? (p as any).std ?? 2})`,
+              value:     `upper=${v.upper.toFixed(2)} lower=${v.lower.toFixed(2)}`,
+              rule:      "price within bands",
+              result:    inBand,
+            });
+          }
+          return v;
+        },
+
+        VOLUME: (p: Parameters<typeof indicators.VOLUME>[0]): number => {
+          const v = indicators.VOLUME(p);
+          if (Number.isFinite(v)) {
+            rowsCollector.push({
+              condition: "Volume",
+              value:     v.toFixed(2),
+              rule:      "volume computed",
+              result:    true,
+            });
+          }
+          return v;
+        },
+      };
+
       const brokerCtxBase = {
         userId:    p.owner_id,
         projectId: p.id,
@@ -646,7 +803,17 @@ async function runProject(p: Project) {
         const prev   = crossPrev.get(key);
         crossPrev.set(key, { a: currA, b: currB });
         if (!prev) return false;
-        return (strict ? prev.a < prev.b : prev.a <= prev.b) && currA > currB;
+        const crossed = (strict ? prev.a < prev.b : prev.a <= prev.b) && currA > currB;
+        // Record an EMA cross row if both values look like prices
+        if (Number.isFinite(currA) && Number.isFinite(currB)) {
+          rowsCollector.push({
+            condition: `Cross Up (A vs B)`,
+            value:     `${currA.toFixed(2)} > ${currB.toFixed(2)}`,
+            rule:      "A crossed above B",
+            result:    crossed,
+          });
+        }
+        return crossed;
       };
 
       const CROSS_DOWN = (a: any, b: any) => {
@@ -658,7 +825,16 @@ async function runProject(p: Project) {
         const prev   = crossPrev.get(key);
         crossPrev.set(key, { a: currA, b: currB });
         if (!prev) return false;
-        return (strict ? prev.a > prev.b : prev.a >= prev.b) && currA < currB;
+        const crossed = (strict ? prev.a > prev.b : prev.a >= prev.b) && currA < currB;
+        if (Number.isFinite(currA) && Number.isFinite(currB)) {
+          rowsCollector.push({
+            condition: `Cross Down (A vs B)`,
+            value:     `${currA.toFixed(2)} < ${currB.toFixed(2)}`,
+            rule:      "A crossed below B",
+            result:    crossed,
+          });
+        }
+        return crossed;
       };
 
       if (advancedLogging) {
@@ -706,6 +882,30 @@ async function runProject(p: Project) {
             ? { ...positionRef.current }   // shallow copy; sufficient for snapshot
             : null;
 
+          // ── 1b) Append guard-condition rows at decision time ─────────────
+          //    Trade-hours and max-trades were already evaluated above in the
+          //    symbol loop (we only reach HP.buy if they passed).  Append
+          //    informational rows so the table is complete.
+          if (settings.trade_hours?.start && settings.trade_hours?.end) {
+            const now    = new Date();
+            const hhmm   = `${String(now.getUTCHours()).padStart(2, "0")}:${String(now.getUTCMinutes()).padStart(2, "0")}`;
+            const rule   = `within ${settings.trade_hours.start}–${settings.trade_hours.end} (UTC)`;
+            rowsCollector.push({ condition: "Active window (UTC)", value: hhmm, rule, result: true });
+          }
+          if (settings.max_trades_per_day !== undefined && Number.isFinite(settings.max_trades_per_day)) {
+            const todayCount = await countTradesToday(supabase, p.id, symbol);
+            rowsCollector.push({
+              condition: "Max trades per day",
+              value:     String(todayCount),
+              rule:      `< ${settings.max_trades_per_day}`,
+              result:    todayCount < settings.max_trades_per_day,
+            });
+          }
+
+          // Snapshot rows — captured at exact decision time
+          const triggerRows = rowsCollector.snapshot();
+          rowsCollector.clear();
+
           // ── 2) Insert TRADE_TRIGGER log ──────────────────────────────────
           const triggerLogId = await insertTriggerLog({
             projectId: p.id,
@@ -716,6 +916,7 @@ async function runProject(p: Project) {
             priceAtTrigger,
             positionBefore,
             runId,
+            rows:      triggerRows,
           });
 
           // ── 3) Execute the order ─────────────────────────────────────────
@@ -755,6 +956,17 @@ async function runProject(p: Project) {
             : null;
           const posQty = Number(positionRef.current?.qty ?? 0);
 
+          // ── 1b) Append guard-condition rows ──────────────────────────────
+          if (settings.trade_hours?.start && settings.trade_hours?.end) {
+            const now    = new Date();
+            const hhmm   = `${String(now.getUTCHours()).padStart(2, "0")}:${String(now.getUTCMinutes()).padStart(2, "0")}`;
+            const rule   = `within ${settings.trade_hours.start}–${settings.trade_hours.end} (UTC)`;
+            rowsCollector.push({ condition: "Active window (UTC)", value: hhmm, rule, result: true });
+          }
+
+          const triggerRows = rowsCollector.snapshot();
+          rowsCollector.clear();
+
           // ── 2) Insert TRADE_TRIGGER log ──────────────────────────────────
           const triggerLogId = await insertTriggerLog({
             projectId:    p.id,
@@ -765,6 +977,7 @@ async function runProject(p: Project) {
             priceAtTrigger,
             positionBefore,
             runId,
+            rows:         triggerRows,
           });
 
           // ── 3) Execute the order ─────────────────────────────────────────
@@ -848,7 +1061,7 @@ async function runProject(p: Project) {
         await runInSandbox(
           freshJs,
           {
-            ...indicators,
+            ...trackedIndicators,
             CROSS_UP,
             CROSS_DOWN,
             COOLDOWN_OK,
