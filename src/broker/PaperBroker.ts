@@ -8,28 +8,45 @@ export type PaperBrokerCtx = {
   projectId: string;
   runId: string;
   symbol: string;
-  exchange: string; // e.g. "binance"
-  tf: string; // default timeframe used for pricing
+  exchange: string;
+  tf: string;
 };
 
 export type BuyArgs = { usd: number };
 export type SellArgs = { pct: number };
 
+/**
+ * Returned by buy() / sell() so callers can build TRADE_EXECUTED logs
+ * and attach trigger_log_id / executed_log_id to the trade row.
+ */
+export type TradeResult = {
+  tradeId:    string | null;
+  fillPrice:  number;
+  filledQty:  number;
+  fee:        number;
+  feeAsset:   string;
+  status:     "SUCCESS" | "REJECTED" | "PARTIAL";
+  orderId:    string | null;
+  /** Position snapshot captured AFTER the trade was recorded */
+  positionAfter?: Record<string, any> | null;
+  /** Non-null if the trade was skipped / failed before reaching the exchange */
+  skipReason?: string;
+};
+
 export class PaperBroker {
-  private sb: SupabaseClient;
+  private sb:    SupabaseClient;
   private cache: KlineCache;
-  private ctx: PaperBrokerCtx;
+  private ctx:   PaperBrokerCtx;
 
   constructor(opts: { supabase: SupabaseClient; cache: KlineCache; ctx: PaperBrokerCtx }) {
-    this.sb = opts.supabase;
+    this.sb    = opts.supabase;
     this.cache = opts.cache;
-    this.ctx = opts.ctx;
+    this.ctx   = opts.ctx;
   }
 
-  /** Latest close for pricing. Returns null if we don't have candles yet. */
+  // ─── Price ────────────────────────────────────────────────────────────────
+
   private getMarkPrice(): number | null {
-    // Try the configured timeframe first, then fall back to 1m and common timeframes
-    // so strategies using non-1m intervals still get a mark price.
     const candidates = [this.ctx.tf, "1m", "5m", "15m", "1h", "4h"];
     for (const tf of candidates) {
       const closes = this.cache.getCloses(this.ctx.exchange, this.ctx.symbol, tf);
@@ -41,63 +58,113 @@ export class PaperBroker {
     return null;
   }
 
-  /** Public accessor for mark price (used by TP/SL in the runner). */
   getMarkPricePublic(): number | null {
     return this.getMarkPrice();
   }
 
-  /** Public accessor for the current open position (used by TP/SL in the runner). */
   async getPosition(): Promise<any | null> {
     return this.getOpenPosition();
   }
 
-  // Intentionally public so sandbox-exposed HP.log can forward to it.
-  async log(level: LogLevel, message: string, meta: Record<string, any> = {}) {
-    // Keep schema-flexible: put details in meta (jsonb).
-    await this.sb.from("project_logs").insert({
-      user_id: this.ctx.userId,
+  // ─── Logging ──────────────────────────────────────────────────────────────
+
+  /**
+   * Insert a log row.
+   * If detail_json is provided it is stored in the new column.
+   * Returns the inserted row ID so callers can link it to a trade.
+   */
+  async log(
+    level:       LogLevel,
+    message:     string,
+    meta:        Record<string, any> = {},
+    detail_json?: Record<string, any> | null,
+  ): Promise<string | null> {
+    const payload: Record<string, any> = {
+      user_id:    this.ctx.userId,
       project_id: this.ctx.projectId,
       level,
       message,
       meta: { ...meta, run_id: this.ctx.runId, symbol: this.ctx.symbol, exchange: this.ctx.exchange },
-    });
+    };
+    if (detail_json !== undefined) {
+      payload.detail_json = detail_json;
+    }
+
+    const { data, error } = await this.sb
+      .from("project_logs")
+      .insert(payload)
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error("project_logs insert error:", error.message);
+      return null;
+    }
+    return (data as any)?.id ?? null;
   }
 
+  // ─── Trade record ─────────────────────────────────────────────────────────
+
   private async insertTrade(args: {
-    side: "buy" | "sell";
-    qty: number;
-    price: number;
-    realizedPnl?: number;
-    fee?: number;
-    ts: string;
-    positionId?: string | null;
-    meta?: Record<string, any>;
-  }) {
-    // Trades/Fills history (append-only). Keep minimal and schema-aligned.
-    const { error } = await this.sb.from("project_trades").insert({
-      user_id: this.ctx.userId,
-      project_id: this.ctx.projectId,
-      run_id: this.ctx.runId,
-      symbol: this.ctx.symbol,
-      side: args.side,
-      qty: args.qty,
-      price: args.price,
-      fee: args.fee ?? 0,
-      ts: args.ts,
-      position_id: args.positionId ?? null,
-      realized_pnl: args.realizedPnl ?? 0,
-      meta: { ...(args.meta ?? {}), mode: "paper" },
-    });
-    // Never break trading/positions flow if trade-history insert fails.
+    side:           "buy" | "sell";
+    qty:            number;
+    price:          number;
+    realizedPnl?:   number;
+    fee?:           number;
+    ts:             string;
+    positionId?:    string | null;
+    meta?:          Record<string, any>;
+    triggerLogId?:  string | null;
+    executedLogId?: string | null;
+  }): Promise<string | null> {
+    const { data, error } = await this.sb
+      .from("project_trades")
+      .insert({
+        user_id:         this.ctx.userId,
+        project_id:      this.ctx.projectId,
+        run_id:          this.ctx.runId,
+        symbol:          this.ctx.symbol,
+        side:            args.side,
+        qty:             args.qty,
+        price:           args.price,
+        fee:             args.fee ?? 0,
+        ts:              args.ts,
+        position_id:     args.positionId ?? null,
+        realized_pnl:    args.realizedPnl ?? 0,
+        meta:            { ...(args.meta ?? {}), mode: "paper" },
+        trigger_log_id:  args.triggerLogId  ?? null,
+        executed_log_id: args.executedLogId ?? null,
+      })
+      .select("id")
+      .single();
+
     if (error) {
       await this.log("warn", "TRADE log failed", {
-        side: args.side,
-        qty: args.qty,
-        price: args.price,
+        side:         args.side,
+        qty:          args.qty,
+        price:        args.price,
         realized_pnl: args.realizedPnl ?? 0,
-        error: String((error as any)?.message ?? error),
+        error:        String((error as any)?.message ?? error),
       });
+      return null;
     }
+    return (data as any)?.id ?? null;
+  }
+
+  /**
+   * Attach trigger_log_id and/or executed_log_id to an existing trade row.
+   * Called by the runner after both logs have been inserted.
+   */
+  async attachLogIds(
+    tradeId:        string,
+    triggerLogId:   string | null,
+    executedLogId:  string | null,
+  ): Promise<void> {
+    const update: Record<string, any> = {};
+    if (triggerLogId  !== null) update.trigger_log_id  = triggerLogId;
+    if (executedLogId !== null) update.executed_log_id = executedLogId;
+    if (Object.keys(update).length === 0) return;
+    await this.sb.from("project_trades").update(update).eq("id", tradeId);
   }
 
   private async getOpenPosition() {
@@ -112,45 +179,39 @@ export class PaperBroker {
     return data as any | null;
   }
 
+  // ─── BUY ──────────────────────────────────────────────────────────────────
+
   /**
-   * Paper buy: opens a new LONG position, or merges into an existing one.
-   *
-   * When a position is already open the new fill is averaged in:
-   *   avgEntryPrice = (existingQty × existingEntry + newQty × fillPrice)
-   *                   / (existingQty + newQty)
-   * The position qty and entry_price are updated in-place; no new position row
-   * is created.  This lets users add to a running position rather than being
-   * blocked.
-   *
-   * The existing safeguard that prevents selling when there is no open position
-   * is unchanged (see sell()).
+   * Paper buy: opens or merges into a LONG position.
+   * Returns a TradeResult so the runner can build TRADE_EXECUTED detail_json.
    */
-  async buy(args: BuyArgs) {
+  async buy(args: BuyArgs): Promise<TradeResult> {
     const usd = Number(args?.usd ?? 0);
     if (!Number.isFinite(usd) || usd <= 0) {
       await this.log("warn", "BUY skipped: invalid usd", { usd });
-      return;
+      return { tradeId: null, fillPrice: 0, filledQty: 0, fee: 0, feeAsset: "USDT", status: "REJECTED", orderId: null, skipReason: "invalid usd" };
     }
 
     const price = this.getMarkPrice();
     if (!price) {
       await this.log("warn", "BUY skipped: no price available", { usd });
-      return;
+      return { tradeId: null, fillPrice: 0, filledQty: 0, fee: 0, feeAsset: "USDT", status: "REJECTED", orderId: null, skipReason: "no price available" };
     }
 
     const newQty = usd / price;
-    const now = new Date().toISOString();
-
+    const now    = new Date().toISOString();
     const existing = await this.getOpenPosition();
 
+    let tradeId: string | null = null;
+    let positionAfter: Record<string, any> | null = null;
+
     if (existing) {
-      // Merge into the existing position using a volume-weighted average entry price.
-      const existingQty = Number(existing.qty ?? 0);
+      const existingQty   = Number(existing.qty ?? 0);
       const existingEntry = Number(existing.entry_price ?? 0);
 
       if (!Number.isFinite(existingQty) || existingQty <= 0 || !Number.isFinite(existingEntry)) {
         await this.log("error", "BUY merge failed: invalid stored position", { position_id: existing.id });
-        return;
+        return { tradeId: null, fillPrice: price, filledQty: 0, fee: 0, feeAsset: "USDT", status: "REJECTED", orderId: null, skipReason: "invalid stored position" };
       }
 
       const totalQty = existingQty + newQty;
@@ -162,206 +223,170 @@ export class PaperBroker {
         .eq("id", existing.id);
       if (error) throw error;
 
-      await this.insertTrade({
-        side: "buy",
-        qty: newQty,
-        price,
-        realizedPnl: 0,
-        fee: 0,
-        ts: now,
+      tradeId = await this.insertTrade({
+        side: "buy", qty: newQty, price,
+        realizedPnl: 0, fee: 0, ts: now,
         positionId: existing.id,
         meta: { usd, reason: "strategy", kind: "add_to_position", avg_entry: avgEntry },
       });
 
+      positionAfter = { qty: totalQty, entry_price: avgEntry, position_id: existing.id };
+
       await this.log("info", "BUY executed (paper, added to position)", {
-        usd,
-        price,
-        new_qty: newQty,
-        total_qty: totalQty,
-        avg_entry: avgEntry,
-        position_id: existing.id,
+        usd, price, new_qty: newQty, total_qty: totalQty, avg_entry: avgEntry, position_id: existing.id,
       });
-      return;
-    }
 
-    // No existing position — open a fresh one.
-    const { data, error } = await this.sb
-      .from("project_positions")
-      .insert({
-        user_id: this.ctx.userId,
-        project_id: this.ctx.projectId,
-        symbol: this.ctx.symbol,
-        side: "long",
-        status: "open",
-        qty: newQty,
-        entry_price: price,
-        entry_time: now,
-        exit_price: null,
-        exit_time: null,
-        realized_pnl: null,
-      })
-      .select("id")
-      .maybeSingle();
-    if (error) {
-      // Concurrent BUY race: another tick inserted a position between our read and write.
-      // Re-fetch the now-existing position and MERGE this buy into it rather than silently
-      // dropping the order. The old "no-op" behaviour caused silent trade loss when two
-      // ticks fired close together (interval_seconds < tick latency) — the duplicate key
-      // error was the symptom, and the dropped buy was the real damage.
-      const anyErr: any = error;
-      if (anyErr?.code === "23505") {
-        const racePos = await this.getOpenPosition();
-        if (racePos) {
-          const existingQty = Number(racePos.qty ?? 0);
-          const existingEntry = Number(racePos.entry_price ?? 0);
-          if (Number.isFinite(existingQty) && existingQty > 0 && Number.isFinite(existingEntry)) {
-            const totalQty = existingQty + newQty;
-            const avgEntry = (existingQty * existingEntry + newQty * price) / totalQty;
-            const { error: mergeErr } = await this.sb
-              .from("project_positions")
-              .update({ qty: totalQty, entry_price: avgEntry })
-              .eq("id", racePos.id);
-            if (mergeErr) throw mergeErr;
-            await this.insertTrade({
-              side: "buy",
-              qty: newQty,
-              price,
-              realizedPnl: 0,
-              fee: 0,
-              ts: now,
-              positionId: racePos.id,
-              meta: { usd, reason: "strategy", kind: "add_to_position_race_merge", avg_entry: avgEntry },
-            });
-            await this.log("info", "BUY executed (paper, merged into race-concurrent position)", {
-              usd, price, new_qty: newQty, total_qty: totalQty, avg_entry: avgEntry, position_id: racePos.id,
-            });
-            return;
+    } else {
+      const { data, error } = await this.sb
+        .from("project_positions")
+        .insert({
+          user_id:     this.ctx.userId,
+          project_id:  this.ctx.projectId,
+          symbol:      this.ctx.symbol,
+          side:        "long",
+          status:      "open",
+          qty:         newQty,
+          entry_price: price,
+          entry_time:  now,
+          exit_price:  null,
+          exit_time:   null,
+          realized_pnl: null,
+        })
+        .select("id")
+        .maybeSingle();
+
+      if (error) {
+        const anyErr: any = error;
+        if (anyErr?.code === "23505") {
+          const racePos = await this.getOpenPosition();
+          if (racePos) {
+            const eQty   = Number(racePos.qty ?? 0);
+            const eEntry = Number(racePos.entry_price ?? 0);
+            if (Number.isFinite(eQty) && eQty > 0 && Number.isFinite(eEntry)) {
+              const totalQty = eQty + newQty;
+              const avgEntry = (eQty * eEntry + newQty * price) / totalQty;
+              const { error: mergeErr } = await this.sb
+                .from("project_positions")
+                .update({ qty: totalQty, entry_price: avgEntry })
+                .eq("id", racePos.id);
+              if (mergeErr) throw mergeErr;
+              tradeId = await this.insertTrade({
+                side: "buy", qty: newQty, price,
+                realizedPnl: 0, fee: 0, ts: now,
+                positionId: racePos.id,
+                meta: { usd, reason: "strategy", kind: "add_to_position_race_merge", avg_entry: avgEntry },
+              });
+              positionAfter = { qty: totalQty, entry_price: avgEntry, position_id: racePos.id };
+              await this.log("info", "BUY executed (paper, merged into race-concurrent position)", {
+                usd, price, new_qty: newQty, total_qty: totalQty, avg_entry: avgEntry, position_id: racePos.id,
+              });
+              return { tradeId, fillPrice: price, filledQty: newQty, fee: 0, feeAsset: "USDT", status: "SUCCESS", orderId: null, positionAfter };
+            }
           }
+          await this.log("warn", "BUY skipped: duplicate constraint hit but position unreadable on re-fetch", { usd, price, qty: newQty });
+          return { tradeId: null, fillPrice: price, filledQty: 0, fee: 0, feeAsset: "USDT", status: "REJECTED", orderId: null, skipReason: "duplicate constraint / race" };
         }
-        // Position exists but re-read returned nothing (extremely unlikely transient issue).
-        await this.log("warn", "BUY skipped: duplicate constraint hit but position unreadable on re-fetch", { usd, price, qty: newQty });
-        return;
+        throw error;
       }
-      throw error;
+
+      const positionId = (data as any)?.id ?? null;
+      tradeId = await this.insertTrade({
+        side: "buy", qty: newQty, price,
+        realizedPnl: 0, fee: 0, ts: now,
+        positionId,
+        meta: { usd, reason: "strategy", kind: "open_position" },
+      });
+
+      positionAfter = { qty: newQty, entry_price: price, position_id: positionId };
+
+      await this.log("info", "BUY executed (paper, new position)", { usd, price, qty: newQty });
     }
 
-    await this.insertTrade({
-      side: "buy",
-      qty: newQty,
-      price,
-      realizedPnl: 0,
-      fee: 0,
-      ts: now,
-      positionId: (data as any)?.id ?? null,
-      meta: { usd, reason: "strategy", kind: "open_position" },
-    });
-
-    await this.log("info", "BUY executed (paper, new position)", { usd, price, qty: newQty });
+    return { tradeId, fillPrice: price, filledQty: newQty, fee: 0, feeAsset: "USDT", status: "SUCCESS", orderId: null, positionAfter };
   }
 
+  // ─── SELL ─────────────────────────────────────────────────────────────────
+
   /**
-   * Paper sell: closes (or partially reduces) the current LONG position.
-   * If no open position exists, it logs and does nothing.
+   * Paper sell: closes or partially reduces the LONG position.
+   * Returns a TradeResult so the runner can build TRADE_EXECUTED detail_json.
    */
-  async sell(args: SellArgs) {
+  async sell(args: SellArgs): Promise<TradeResult> {
     const pct = Number(args?.pct ?? 0);
     if (!Number.isFinite(pct) || pct <= 0) {
       await this.log("warn", "SELL skipped: invalid pct", { pct });
-      return;
+      return { tradeId: null, fillPrice: 0, filledQty: 0, fee: 0, feeAsset: "USDT", status: "REJECTED", orderId: null, skipReason: "invalid pct" };
     }
 
     const pos = await this.getOpenPosition();
     if (!pos) {
-      // No open position — log a warning and do nothing.
-      // Do NOT insert a trade row; phantom sell records pollute Filled Orders.
       await this.log("warn", "SELL skipped: no open position", { pct });
-      return;
+      return { tradeId: null, fillPrice: 0, filledQty: 0, fee: 0, feeAsset: "USDT", status: "REJECTED", orderId: null, skipReason: "no open position" };
     }
 
     const price = this.getMarkPrice();
     if (!price) {
       await this.log("warn", "SELL skipped: no price available", { pct, position_id: pos.id });
-      return;
+      return { tradeId: null, fillPrice: 0, filledQty: 0, fee: 0, feeAsset: "USDT", status: "REJECTED", orderId: null, skipReason: "no price available" };
     }
 
     const entryPrice = Number(pos.entry_price ?? 0);
-    const qty = Number(pos.qty ?? 0);
+    const qty        = Number(pos.qty ?? 0);
     if (!Number.isFinite(entryPrice) || !Number.isFinite(qty) || qty <= 0) {
       await this.log("error", "SELL failed: invalid stored position", { position_id: pos.id });
-      return;
+      return { tradeId: null, fillPrice: price, filledQty: 0, fee: 0, feeAsset: "USDT", status: "REJECTED", orderId: null, skipReason: "invalid stored position" };
     }
 
-    const closeFrac = Math.min(1, pct / 100);
-    const closeQty = qty * closeFrac;
+    const closeFrac    = Math.min(1, pct / 100);
+    const closeQty     = qty * closeFrac;
     const remainingQty = qty - closeQty;
-    const realized = (price - entryPrice) * closeQty;
-    const now = new Date().toISOString();
+    const realized     = (price - entryPrice) * closeQty;
+    const now          = new Date().toISOString();
+
+    let tradeId: string | null = null;
+    let positionAfter: Record<string, any> | null = null;
 
     if (remainingQty <= 1e-12) {
-      // Full close
       const { error } = await this.sb
         .from("project_positions")
-        .update({
-          status: "closed",
-          exit_price: price,
-          exit_time: now,
-          realized_pnl: realized,
-        })
+        .update({ status: "closed", exit_price: price, exit_time: now, realized_pnl: realized })
         .eq("id", pos.id);
       if (error) throw error;
 
-      await this.insertTrade({
-        side: "sell",
-        qty: closeQty,
-        price,
-        realizedPnl: realized,
-        fee: 0,
-        ts: now,
+      tradeId = await this.insertTrade({
+        side: "sell", qty: closeQty, price,
+        realizedPnl: realized, fee: 0, ts: now,
         positionId: pos.id,
         meta: { pct, kind: "close", reason: "strategy" },
       });
 
+      positionAfter = { qty: 0, status: "closed", exit_price: price, position_id: pos.id };
+
       await this.log("info", "SELL executed (paper, close)", {
-        pct,
-        price,
-        qty_closed: closeQty,
-        realized_pnl: realized,
-        position_id: pos.id,
+        pct, price, qty_closed: closeQty, realized_pnl: realized, position_id: pos.id,
       });
-      return;
+    } else {
+      const prevRealized = Number(pos.realized_pnl ?? 0) || 0;
+      const { error } = await this.sb
+        .from("project_positions")
+        .update({ qty: remainingQty, realized_pnl: prevRealized + realized })
+        .eq("id", pos.id);
+      if (error) throw error;
+
+      tradeId = await this.insertTrade({
+        side: "sell", qty: closeQty, price,
+        realizedPnl: realized, fee: 0, ts: now,
+        positionId: pos.id,
+        meta: { pct, kind: "partial", reason: "strategy" },
+      });
+
+      positionAfter = { qty: remainingQty, entry_price: entryPrice, position_id: pos.id };
+
+      await this.log("info", "SELL executed (paper, partial)", {
+        pct, price, qty_closed: closeQty, qty_remaining: remainingQty, realized_pnl_add: realized, position_id: pos.id,
+      });
     }
 
-    // Partial close (keep position open with reduced qty)
-    const prevRealized = Number(pos.realized_pnl ?? 0) || 0;
-    const { error } = await this.sb
-      .from("project_positions")
-      .update({
-        qty: remainingQty,
-        // B-04 fix: only update qty and running realized_pnl — do NOT set exit_price/exit_time
-        // on a still-open position, or queries using `exit_price IS NOT NULL` will misread it.
-        realized_pnl: prevRealized + realized,
-      })
-      .eq("id", pos.id);
-    if (error) throw error;
-
-    await this.insertTrade({
-      side: "sell",
-      qty: closeQty,
-      price,
-      realizedPnl: realized,
-      fee: 0,
-      ts: now,
-      positionId: pos.id,
-      meta: { pct, kind: "partial", reason: "strategy" },
-    });
-
-    await this.log("info", "SELL executed (paper, partial)", {
-      pct,
-      price,
-      qty_closed: closeQty,
-      qty_remaining: remainingQty,
-      realized_pnl_add: realized,
-      position_id: pos.id,
-    });
+    return { tradeId, fillPrice: price, filledQty: closeQty, fee: 0, feeAsset: "USDT", status: "SUCCESS", orderId: null, positionAfter };
   }
 }

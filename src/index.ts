@@ -1,43 +1,48 @@
 /**
  * src/index.ts  (hornpub-runner)
  *
- * Changes vs. original:
- *  - Import decryptString / isCiphertext from ./encryption.js
- *  - In the wallet-loading block, decrypt api_key_enc / api_secret_enc
- *    (with fallback to the legacy external_key / address columns for wallets
- *     saved before encryption was rolled out).
- *  - Guard: if decryption fails, log a clear error and skip live mode
- *    (fall back to paper mode) rather than crashing the runner.
- *  - NEVER log raw key material. Mask to first-8-chars fingerprint only.
+ * Changes in this revision:
+ *  - log() now returns the inserted log row ID (string | null).
+ *  - HP.buy / HP.sell capture a trigger snapshot at decision-time (exact
+ *    mark price + position state at call time) and emit two structured logs:
+ *      1) TRADE_TRIGGER  (detail_json.kind = "trade_trigger")
+ *      2) TRADE_EXECUTED (detail_json.kind = "trade_executed")
+ *    Both log IDs are stored on the project_trades row via trigger_log_id /
+ *    executed_log_id.  This is fully backwards-compatible — old trades that
+ *    have no log IDs continue to render without those columns.
+ *  - Slippage is computed immediately after execution using the trigger price
+ *    that was captured before the order was placed.
+ *  - No indicators are re-evaluated; the snapshot is captured from broker
+ *    state (mark price, position cache) at the moment HP.buy/sell is invoked.
  *
- * All other logic is unchanged from the original file.
+ * All other logic is unchanged from the previous revision.
  */
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { KlineManager } from "./klines/KlineManager.js";
+import { KlineManager }       from "./klines/KlineManager.js";
 import { SupabaseKlineStore } from "./klines/SupabaseKlineStore.js";
-import { KlineCache } from "./klines/KlineCache.js";
-import createIndicators from "./indicators/createIndicators.js";
-import { runInSandbox } from "./engine/Sandbox.js";
-import { PaperBroker } from "./broker/PaperBroker.js";
-import { LiveBroker } from "./broker/LiveBroker.js";
-import { decryptString, isCiphertext } from "./encryption.js";   // ← NEW
+import { KlineCache }         from "./klines/KlineCache.js";
+import createIndicators       from "./indicators/createIndicators.js";
+import { runInSandbox }       from "./engine/Sandbox.js";
+import { PaperBroker }        from "./broker/PaperBroker.js";
+import { LiveBroker }         from "./broker/LiveBroker.js";
+import { decryptString, isCiphertext } from "./encryption.js";
 
-// ─── Settings helpers ────────────────────────────────────────────────────────
+// ─── Settings helpers ─────────────────────────────────────────────────────────
 
-type TradeHours = { start: string; end: string };
+type TradeHours      = { start: string; end: string };
 type ProjectSettings = {
-  mode?: string;
-  wallet_id?: string;
-  trade_hours?: TradeHours;
-  disable_weekends?: boolean;
+  mode?:               string;
+  wallet_id?:          string;
+  trade_hours?:        TradeHours;
+  disable_weekends?:   boolean;
   max_trades_per_day?: number;
-  advanced_logging?: boolean;
+  advanced_logging?:   boolean;
 };
 
 function isWithinTradeHours(hours: TradeHours | undefined): boolean {
   if (!hours?.start || !hours?.end) return true;
-  const now = new Date();
+  const now  = new Date();
   const hhmm = (h: string) => {
     const [hh, mm] = h.split(":").map(Number);
     return (hh ?? 0) * 60 + (mm ?? 0);
@@ -53,11 +58,7 @@ function isWeekend(): boolean {
   return [0, 6].includes(new Date().getUTCDay());
 }
 
-async function countTradesToday(
-  supabase: SupabaseClient,
-  projectId: string,
-  symbol: string
-): Promise<number> {
+async function countTradesToday(supabase: SupabaseClient, projectId: string, symbol: string): Promise<number> {
   const start = new Date();
   start.setUTCHours(0, 0, 0, 0);
   const { count } = await supabase
@@ -70,7 +71,7 @@ async function countTradesToday(
   return count ?? 0;
 }
 
-// ─── Supabase client ─────────────────────────────────────────────────────────
+// ─── Supabase client ──────────────────────────────────────────────────────────
 
 const SUPABASE_URL              = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -105,12 +106,7 @@ async function getLastTradeTs(projectId: string, symbol: string): Promise<string
   return (data as any)?.ts ?? null;
 }
 
-function barsSinceTimestamp(
-  exchange: string,
-  symbol: string,
-  tf: string,
-  tsIso: string | null
-): number {
+function barsSinceTimestamp(exchange: string, symbol: string, tf: string, tsIso: string | null): number {
   if (!tsIso) return Number.POSITIVE_INFINITY;
   const tsMs = Date.parse(tsIso);
   if (!Number.isFinite(tsMs)) return Number.POSITIVE_INFINITY;
@@ -130,7 +126,7 @@ function extractTimeframesFromCode(code: string): string[] {
     if (tfs.length > 0) return tfs;
   }
   const out = new Set<string>();
-  const re = /\btf\s*:\s*["'']([^"'']+)["']/g;
+  const re  = /\btf\s*:\s*["'']([^"'']+)["']/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(code))) out.add(m[1]);
   if (out.size === 0) out.add("1m");
@@ -138,82 +134,216 @@ function extractTimeframesFromCode(code: string): string[] {
 }
 
 type Project = {
-  id: string;
-  owner_id: string;
-  generated_js: string | null;
+  id:               string;
+  owner_id:         string;
+  generated_js:     string | null;
   interval_seconds: number;
-  mode?: string;
-  settings_json?: Record<string, any>;
+  mode?:            string;
+  settings_json?:   Record<string, any>;
 };
 
+// ─── Log helper ───────────────────────────────────────────────────────────────
+
+/**
+ * Insert a project log row.
+ * Returns the inserted log ID (used to link trigger/execution logs to trades).
+ */
 async function log(
-  projectId: string,
-  ownerId: string,
-  level: string,
-  message: string,
-  meta: Record<string, any> = {}
-) {
-  const { error } = await supabase.from("project_logs").insert({
+  projectId:    string,
+  ownerId:      string,
+  level:        string,
+  message:      string,
+  meta:         Record<string, any>         = {},
+  detail_json?: Record<string, any> | null,
+): Promise<string | null> {
+  const payload: Record<string, any> = {
     project_id: projectId,
     user_id:    ownerId,
     level,
     message,
     meta,
-  });
+  };
+  if (detail_json !== undefined) {
+    payload.detail_json = detail_json;
+  }
+
+  const { data, error } = await supabase
+    .from("project_logs")
+    .insert(payload)
+    .select("id")
+    .single();
+
   if (error) {
     console.error("project_logs insert error:", error.message);
+    return null;
   }
+  return (data as any)?.id ?? null;
 }
 
-// ─── NEW: Safe wallet credential resolver ─────────────────────────────────────
+// ─── Trade detail logging helpers ────────────────────────────────────────────
+
 /**
- * Given a row from the `wallets` table, return the plaintext API key and secret.
+ * Compute slippage between the mark price at trigger time and the actual fill.
  *
- * Priority:
- *  1. api_key_enc / api_secret_enc   — new encrypted columns (preferred)
- *  2. external_key / address          — legacy plaintext columns (backward compat)
- *
- * Throws if decryption fails (wrong key, tampered token, etc.).
- * Callers MUST catch and handle by falling back to paper mode.
+ * Convention:
+ *   BUY:  positive slippage_pct  = paid more than expected (worse for user)
+ *   SELL: positive slippage_pct  = received less than expected (worse for user)
  */
-function resolveWalletCredentials(wallet: Record<string, any>): {
-  apiKey: string;
-  apiSecret: string;
+function computeSlippage(
+  side:         "BUY" | "SELL",
+  triggerPrice: number,
+  filledPrice:  number,
+): {
+  basis:          "trigger_price";
+  trigger_price:  number;
+  filled_price:   number;
+  slippage_abs:   number;
+  slippage_pct:   number;
 } {
-  // ── New encrypted path ────────────────────────────────────────────────────
+  const slippage_abs =
+    side === "BUY"
+      ? filledPrice - triggerPrice
+      : triggerPrice - filledPrice;
+
+  const slippage_pct =
+    triggerPrice > 0
+      ? (slippage_abs / triggerPrice) * 100
+      : 0;
+
+  return {
+    basis:         "trigger_price",
+    trigger_price: triggerPrice,
+    filled_price:  filledPrice,
+    slippage_abs,
+    slippage_pct,
+  };
+}
+
+/**
+ * Insert TRADE_TRIGGER log (before order placement).
+ * Captures the exact mark price and position snapshot at decision time.
+ * Returns the log ID.
+ */
+async function insertTriggerLog(opts: {
+  projectId:       string;
+  ownerId:         string;
+  side:            "BUY" | "SELL";
+  symbol:          string;
+  interval:        string;
+  priceAtTrigger:  number;
+  positionBefore:  Record<string, any> | null;
+  runId:           string;
+}): Promise<string | null> {
+  const { projectId, ownerId, side, symbol, interval, priceAtTrigger, positionBefore, runId } = opts;
+  const primaryReason = side === "BUY" ? "Strategy BUY signal" : "Strategy SELL signal";
+
+  const detail_json: Record<string, any> = {
+    kind:             "trade_trigger",
+    side,
+    symbol,
+    interval,
+    price_at_trigger: priceAtTrigger,
+    trigger: {
+      primary_reason: primaryReason,
+      // conditions array: strategies may extend this in future; empty for generic strategies
+      conditions: [],
+      context: {
+        position_before: positionBefore
+          ? {
+              qty:         positionBefore.qty         ?? null,
+              entry_price: positionBefore.entry_price ?? null,
+              entry_time:  positionBefore.entry_time  ?? null,
+              position_id: positionBefore.id          ?? null,
+            }
+          : null,
+      },
+    },
+  };
+
+  return log(
+    projectId,
+    ownerId,
+    "info",
+    `TRADE_TRIGGER ${side} ${symbol} (${primaryReason})`,
+    { run_id: runId, symbol, exchange: "binance" },
+    detail_json,
+  );
+}
+
+/**
+ * Insert TRADE_EXECUTED log (after order fills back).
+ * Slippage is computed here immediately while triggerPrice is still in scope.
+ * Returns the log ID.
+ */
+async function insertExecutedLog(opts: {
+  projectId:      string;
+  ownerId:        string;
+  side:           "BUY" | "SELL";
+  symbol:         string;
+  triggerPrice:   number;
+  result:         import("./broker/PaperBroker.js").TradeResult;
+  requestedQty:   number;
+  requestedUsd?:  number;
+  runId:          string;
+}): Promise<string | null> {
+  const { projectId, ownerId, side, symbol, triggerPrice, result, requestedQty, requestedUsd, runId } = opts;
+
+  const slippage = result.status !== "REJECTED"
+    ? computeSlippage(side, triggerPrice, result.fillPrice)
+    : null;
+
+  const detail_json: Record<string, any> = {
+    kind:             "trade_executed",
+    side,
+    symbol,
+    order_type:       "MARKET",
+    requested_qty:    requestedQty,
+    filled_qty:       result.filledQty,
+    requested_price:  null, // MARKET orders have no requested price
+    filled_price:     result.fillPrice,
+    status:           result.status,
+    exchange_order_id: result.orderId,
+    fees: {
+      amount: result.fee,
+      asset:  result.feeAsset,
+    },
+    slippage,
+    position_after: result.positionAfter ?? null,
+    ...(result.skipReason ? { error: { reason: result.skipReason } } : {}),
+  };
+
+  const statusLabel = result.status === "SUCCESS" ? "filled" : result.status.toLowerCase();
+  return log(
+    projectId,
+    ownerId,
+    "info",
+    `TRADE_EXECUTED ${side} ${symbol} (${statusLabel})`,
+    { run_id: runId, symbol, exchange: "binance" },
+    detail_json,
+  );
+}
+
+// ─── Wallet credentials ───────────────────────────────────────────────────────
+
+function resolveWalletCredentials(wallet: Record<string, any>): { apiKey: string; apiSecret: string } {
   const encKey    = wallet.api_key_enc    as string | null | undefined;
   const encSecret = wallet.api_secret_enc as string | null | undefined;
 
   if (encKey && encSecret) {
     if (!isCiphertext(encKey) || !isCiphertext(encSecret)) {
-      throw new Error(
-        'api_key_enc / api_secret_enc look malformed. ' +
-        'Re-save the wallet to re-encrypt with the current key.'
-      );
+      throw new Error("api_key_enc / api_secret_enc look malformed. Re-save the wallet to re-encrypt.");
     }
-    // May throw — intentional, caller must catch
-    const apiKey    = decryptString(encKey);
-    const apiSecret = decryptString(encSecret);
-    return { apiKey, apiSecret };
+    return { apiKey: decryptString(encKey), apiSecret: decryptString(encSecret) };
   }
 
-  // ── Legacy plaintext fallback (wallets saved before encryption rollout) ───
-  // Log a warning so operators know to migrate.
   const legacyKey    = wallet.external_key as string | null | undefined;
   const legacySecret = wallet.address      as string | null | undefined;
-
   if (legacyKey && legacySecret) {
-    console.warn(
-      '[encryption] Wallet is using legacy plaintext columns. ' +
-      'Please have the user re-save their API keys to enable encryption.'
-    );
+    console.warn("[encryption] Wallet is using legacy plaintext columns. Please re-save API keys.");
     return { apiKey: legacyKey, apiSecret: legacySecret };
   }
 
-  throw new Error(
-    'Wallet has neither encrypted (api_key_enc) nor legacy (external_key) credentials. ' +
-    'The user must re-save their API keys.'
-  );
+  throw new Error("Wallet has neither encrypted nor legacy credentials. Re-save API keys.");
 }
 
 // ─── Project runner ───────────────────────────────────────────────────────────
@@ -243,12 +373,10 @@ async function runProject(p: Project) {
       .single();
     if (projErr) throw projErr;
 
-    const settings: ProjectSettings & {
-      binance_api_key?:    string;
-      binance_api_secret?: string;
-    } = ((projRow as any)?.settings_json ?? {}) as any;
+    const settings: ProjectSettings & { binance_api_key?: string; binance_api_secret?: string } =
+      ((projRow as any)?.settings_json ?? {}) as any;
 
-    const resolvedMode   = (settings.mode ?? p.mode) === "live" ? "live" : "paper";
+    const resolvedMode    = (settings.mode ?? p.mode) === "live" ? "live" : "paper";
     const advancedLogging = settings.advanced_logging === true;
 
     await supabase.from("project_runs").update({ mode: resolvedMode }).eq("id", runId);
@@ -280,6 +408,7 @@ async function runProject(p: Project) {
           .filter(Boolean)
       ),
     ];
+
     const freshJs = String((projRow as any)?.generated_js ?? p.generated_js ?? "").trim();
     if (!freshJs) {
       await log(p.id, p.owner_id, "warn", "No generated_js found. Skipping run.");
@@ -343,20 +472,16 @@ async function runProject(p: Project) {
         runId,
         symbol,
         exchange: "binance",
-        tf: primaryTf,
+        tf:       primaryTf,
       };
 
-      // ── Resolve Binance API credentials ─────────────────────────────────
-      // Env-var / settings_json fallbacks (used when no wallet is linked).
       let binanceApiKey    = settings.binance_api_key    ?? process.env.BINANCE_API_KEY    ?? "";
       let binanceApiSecret = settings.binance_api_secret ?? process.env.BINANCE_API_SECRET ?? "";
 
       if (settings.wallet_id) {
-        // Fetch both the new encrypted columns AND the old plaintext columns
-        // so resolveWalletCredentials() can fall back gracefully.
         const { data: wallet, error: walletErr } = await supabase
           .from("wallets")
-          .select("api_key_enc, api_secret_enc, external_key, address")  // ← NEW: encrypted cols first
+          .select("api_key_enc, api_secret_enc, external_key, address")
           .eq("id", settings.wallet_id)
           .eq("owner_id", p.owner_id)
           .maybeSingle();
@@ -366,33 +491,23 @@ async function runProject(p: Project) {
             ? `Failed to load wallet ${settings.wallet_id}: ${walletErr.message}`
             : `Wallet ${settings.wallet_id} not found or not owned by this user`;
           await log(p.id, p.owner_id, "error", errMsg, { run_id: runId, symbol });
-          // Continue with empty keys — live mode guard below will catch this.
         } else {
-          // ── Decrypt here — do NOT pass encrypted blobs into the broker ──
           try {
-            const creds = resolveWalletCredentials(wallet);
+            const creds  = resolveWalletCredentials(wallet);
             binanceApiKey    = creds.apiKey;
             binanceApiSecret = creds.apiSecret;
           } catch (decryptErr: any) {
-            // Decryption failed: wrong ENCRYPTION_SECRET, tampered token, etc.
-            // Log clearly and disable live mode for this symbol — do NOT crash.
-            console.error(
-              `[runner] Decryption failed for wallet ${settings.wallet_id}: ${decryptErr?.message}`
-            );
+            console.error(`[runner] Decryption failed for wallet ${settings.wallet_id}: ${decryptErr?.message}`);
             await log(p.id, p.owner_id, "error",
               `[SECURITY] Credential decryption failed for wallet ${settings.wallet_id}: ` +
               `${decryptErr?.message} — falling back to paper mode for ${symbol}.`,
               { run_id: runId, symbol, wallet_id: settings.wallet_id }
             );
-            // Force paper mode for this symbol by blanking the keys.
             binanceApiKey    = "";
             binanceApiSecret = "";
           }
         }
       }
-
-      // ── Safety: never log raw key material ───────────────────────────────
-      // (Only log the first-8-char fingerprint, never the full key.)
 
       const isLiveMode = resolvedMode === "live";
       let broker: PaperBroker | LiveBroker;
@@ -408,11 +523,7 @@ async function runProject(p: Project) {
           const liveBroker = new LiveBroker({
             supabase,
             cache: klineCache,
-            ctx: {
-              ...brokerCtxBase,
-              apiKey:    binanceApiKey,    // plaintext — only ever in memory
-              apiSecret: binanceApiSecret, // plaintext — only ever in memory
-            },
+            ctx: { ...brokerCtxBase, apiKey: binanceApiKey, apiSecret: binanceApiSecret },
           });
 
           const { ok, error: connErr } = await liveBroker.testConnectivity();
@@ -422,7 +533,6 @@ async function runProject(p: Project) {
               { run_id: runId, symbol }
             );
             symbolFailures++;
-            // Zero out in-memory secrets as soon as we're done with them
             binanceApiKey    = "";
             binanceApiSecret = "";
             continue;
@@ -432,15 +542,10 @@ async function runProject(p: Project) {
           if (advancedLogging) {
             await log(p.id, p.owner_id, "info",
               `[LIVE] Binance connectivity OK for ${symbol}`,
-              {
-                run_id:          runId,
-                symbol,
-                key_fingerprint: binanceApiKey.slice(0, 8) + "…",  // ← safe
-              }
+              { run_id: runId, symbol, key_fingerprint: binanceApiKey.slice(0, 8) + "…" }
             );
           }
 
-          // Zero out after handing to broker (broker holds its own copy via ctx)
           binanceApiKey    = "";
           binanceApiSecret = "";
         }
@@ -448,67 +553,8 @@ async function runProject(p: Project) {
         broker = new PaperBroker({ supabase, cache: klineCache, ctx: brokerCtxBase });
       }
 
-      // ── HP surface (unchanged from original) ─────────────────────────────
+      // ── Position snapshot helpers ────────────────────────────────────────
 
-      const HP = {
-        buy: async (a: any, b?: any) => {
-          const usd = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.usd ?? 0);
-          await broker.buy({ usd });
-          await refreshPositionRef();
-        },
-        sell: async (a: any, b?: any) => {
-          const pct = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.pct ?? 100);
-          await broker.sell({ pct });
-          await refreshPositionRef();
-        },
-        log: async (msg: string) => broker.log("info", String(msg)),
-        takeProfitCheck: async (a: any): Promise<boolean> => {
-          const pct = Number((a as any)?.pct ?? a);
-          if (!Number.isFinite(pct) || pct <= 0) return false;
-          const pos = await broker.getPosition();
-          if (!pos) return false;
-          const markPrice  = broker.getMarkPricePublic();
-          if (!markPrice) return false;
-          const entryPrice = Number(pos.entry_price ?? 0);
-          if (!Number.isFinite(entryPrice) || entryPrice <= 0) return false;
-          const tpPrice = entryPrice * (1 + pct / 100);
-          if (markPrice >= tpPrice) {
-            if (advancedLogging) {
-              await broker.log("info",
-                `TAKE_PROFIT triggered: price ${markPrice.toFixed(6)} >= TP level ${tpPrice.toFixed(6)} (entry ${entryPrice.toFixed(6)} +${pct}%)`,
-                { trigger: "take_profit", pct, mark_price: markPrice, tp_price: tpPrice, entry_price: entryPrice }
-              );
-            }
-            await broker.sell({ pct: 100 });
-            return true;
-          }
-          return false;
-        },
-        stopLossCheck: async (a: any): Promise<boolean> => {
-          const pct = Number((a as any)?.pct ?? a);
-          if (!Number.isFinite(pct) || pct <= 0) return false;
-          const pos = await broker.getPosition();
-          if (!pos) return false;
-          const markPrice  = broker.getMarkPricePublic();
-          if (!markPrice) return false;
-          const entryPrice = Number(pos.entry_price ?? 0);
-          if (!Number.isFinite(entryPrice) || entryPrice <= 0) return false;
-          const slPrice = entryPrice * (1 - pct / 100);
-          if (markPrice <= slPrice) {
-            if (advancedLogging) {
-              await broker.log("info",
-                `STOP_LOSS triggered: price ${markPrice.toFixed(6)} <= SL level ${slPrice.toFixed(6)} (entry ${entryPrice.toFixed(6)} -${pct}%)`,
-                { trigger: "stop_loss", pct, mark_price: markPrice, sl_price: slPrice, entry_price: entryPrice }
-              );
-            }
-            await broker.sell({ pct: 100 });
-            return true;
-          }
-          return false;
-        },
-      };
-
-      // Position snapshot helpers (unchanged from original)
       const { data: openPosInitial } = await supabase
         .from("project_positions")
         .select("id, entry_time, entry_price, qty")
@@ -517,8 +563,8 @@ async function runProject(p: Project) {
         .eq("status", "open")
         .maybeSingle();
 
-      const lastTradeTs = await getLastTradeTs(p.id, symbol);
-      const positionRef = { current: openPosInitial as typeof openPosInitial | null };
+      const lastTradeTs  = await getLastTradeTs(p.id, symbol);
+      const positionRef  = { current: openPosInitial as typeof openPosInitial | null };
 
       async function refreshPositionRef() {
         const { data } = await supabase
@@ -532,43 +578,39 @@ async function runProject(p: Project) {
       }
 
       let crossCallIdx = 0;
-      const IN_POSITION = () => Boolean(positionRef.current?.id);
 
+      const IN_POSITION     = () => Boolean(positionRef.current?.id);
       const BARS_SINCE_ENTRY = () => {
         if (!positionRef.current?.entry_time) return Number.POSITIVE_INFINITY;
         return barsSinceTimestamp("binance", symbol, primaryTf, String(positionRef.current.entry_time));
       };
 
       const COOLDOWN_OK = (p2: { bars: number; scope?: string }) => {
-        const bars     = Math.max(0, Math.floor(Number((p2 as any)?.bars ?? 0)));
-        const scopeRaw = String((p2 as any)?.scope ?? "last_trade").toLowerCase();
-        let referenceTs: string | null;
-        if (scopeRaw === "entry") {
-          referenceTs = positionRef.current?.entry_time ? String(positionRef.current.entry_time) : null;
-        } else {
-          referenceTs = lastTradeTs;
-        }
-        const since = barsSinceTimestamp("binance", symbol, primaryTf, referenceTs);
-        return since >= bars;
+        const bars      = Math.max(0, Math.floor(Number((p2 as any)?.bars ?? 0)));
+        const scopeRaw  = String((p2 as any)?.scope ?? "last_trade").toLowerCase();
+        const referenceTs: string | null =
+          scopeRaw === "entry"
+            ? positionRef.current?.entry_time ? String(positionRef.current.entry_time) : null
+            : lastTradeTs;
+        return barsSinceTimestamp("binance", symbol, primaryTf, referenceTs) >= bars;
       };
 
-      // Returns current USD value of holdings (qty × mark price), or NaN if no position.
       const POSITION_VALUE = (): number => {
         if (!positionRef.current) return Number.NaN;
-        const qty = Number(positionRef.current.qty ?? NaN);
+        const qty       = Number(positionRef.current.qty ?? NaN);
         const markPrice = broker.getMarkPricePublic();
         if (!Number.isFinite(qty) || qty <= 0 || !markPrice) return Number.NaN;
         return qty * markPrice;
       };
 
       const TAKE_PROFIT = (p2: { pct: number }): boolean => {
-        const pct = Number((p2 as any)?.pct ?? 0);
+        const pct        = Number((p2 as any)?.pct ?? 0);
         if (!Number.isFinite(pct) || pct <= 0 || !positionRef.current) return false;
         const entryPrice = Number(positionRef.current.entry_price ?? 0);
         if (!Number.isFinite(entryPrice) || entryPrice <= 0) return false;
-        const markPrice = broker.getMarkPricePublic();
+        const markPrice  = broker.getMarkPricePublic();
         if (!markPrice) return false;
-        const triggered = markPrice >= entryPrice * (1 + pct / 100);
+        const triggered  = markPrice >= entryPrice * (1 + pct / 100);
         if (triggered && advancedLogging) {
           void broker.log("info",
             `TAKE_PROFIT condition met: price ${markPrice.toFixed(6)} >= entry ${entryPrice.toFixed(6)} +${pct}%`,
@@ -579,13 +621,13 @@ async function runProject(p: Project) {
       };
 
       const STOP_LOSS = (p2: { pct: number }): boolean => {
-        const pct = Number((p2 as any)?.pct ?? 0);
+        const pct        = Number((p2 as any)?.pct ?? 0);
         if (!Number.isFinite(pct) || pct <= 0 || !positionRef.current) return false;
         const entryPrice = Number(positionRef.current.entry_price ?? 0);
         if (!Number.isFinite(entryPrice) || entryPrice <= 0) return false;
-        const markPrice = broker.getMarkPricePublic();
+        const markPrice  = broker.getMarkPricePublic();
         if (!markPrice) return false;
-        const triggered = markPrice <= entryPrice * (1 - pct / 100);
+        const triggered  = markPrice <= entryPrice * (1 - pct / 100);
         if (triggered && advancedLogging) {
           void broker.log("info",
             `STOP_LOSS condition met: price ${markPrice.toFixed(6)} <= entry ${entryPrice.toFixed(6)} -${pct}%`,
@@ -642,6 +684,166 @@ async function runProject(p: Project) {
         }
       }
 
+      // ── HP surface ────────────────────────────────────────────────────────
+      //
+      // TRIGGER SNAPSHOT INTEGRITY:
+      //   The mark price and position snapshot captured here are taken from
+      //   broker state at the EXACT MOMENT HP.buy/HP.sell is invoked by the
+      //   strategy.  The strategy has already evaluated its conditions and
+      //   decided to act — this is decision-time.  We do NOT re-evaluate any
+      //   indicators.  The values come directly from:
+      //     - broker.getMarkPricePublic()  — last close from the kline cache
+      //     - positionRef.current          — last DB read of the open position
+      //   Both are captured synchronously before any async work begins.
+
+      const HP = {
+        buy: async (a: any, b?: any) => {
+          const usd = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.usd ?? 0);
+
+          // ── 1) Capture trigger snapshot synchronously at decision-time ───
+          const priceAtTrigger = broker.getMarkPricePublic() ?? 0;
+          const positionBefore = positionRef.current
+            ? { ...positionRef.current }   // shallow copy; sufficient for snapshot
+            : null;
+
+          // ── 2) Insert TRADE_TRIGGER log ──────────────────────────────────
+          const triggerLogId = await insertTriggerLog({
+            projectId: p.id,
+            ownerId:   p.owner_id,
+            side:      "BUY",
+            symbol,
+            interval:  primaryTf,
+            priceAtTrigger,
+            positionBefore,
+            runId,
+          });
+
+          // ── 3) Execute the order ─────────────────────────────────────────
+          const result = await broker.buy({ usd });
+
+          // ── 4) Compute slippage & insert TRADE_EXECUTED log ──────────────
+          //    Slippage is computed here, immediately after execution,
+          //    while priceAtTrigger is still in the closure.
+          const requestedQty = priceAtTrigger > 0 ? usd / priceAtTrigger : 0;
+          const executedLogId = await insertExecutedLog({
+            projectId:    p.id,
+            ownerId:      p.owner_id,
+            side:         "BUY",
+            symbol,
+            triggerPrice: priceAtTrigger,
+            result,
+            requestedQty,
+            requestedUsd: usd,
+            runId,
+          });
+
+          // ── 5) Attach both log IDs to the trade row ──────────────────────
+          if (result.tradeId && (triggerLogId || executedLogId)) {
+            await broker.attachLogIds(result.tradeId, triggerLogId, executedLogId);
+          }
+
+          await refreshPositionRef();
+        },
+
+        sell: async (a: any, b?: any) => {
+          const pct = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.pct ?? 100);
+
+          // ── 1) Capture trigger snapshot synchronously at decision-time ───
+          const priceAtTrigger = broker.getMarkPricePublic() ?? 0;
+          const positionBefore = positionRef.current
+            ? { ...positionRef.current }
+            : null;
+          const posQty = Number(positionRef.current?.qty ?? 0);
+
+          // ── 2) Insert TRADE_TRIGGER log ──────────────────────────────────
+          const triggerLogId = await insertTriggerLog({
+            projectId:    p.id,
+            ownerId:      p.owner_id,
+            side:         "SELL",
+            symbol,
+            interval:     primaryTf,
+            priceAtTrigger,
+            positionBefore,
+            runId,
+          });
+
+          // ── 3) Execute the order ─────────────────────────────────────────
+          const result = await broker.sell({ pct });
+
+          // ── 4) Insert TRADE_EXECUTED log ─────────────────────────────────
+          const closeFrac    = Math.min(1, pct / 100);
+          const requestedQty = posQty * closeFrac;
+          const executedLogId = await insertExecutedLog({
+            projectId:    p.id,
+            ownerId:      p.owner_id,
+            side:         "SELL",
+            symbol,
+            triggerPrice: priceAtTrigger,
+            result,
+            requestedQty,
+            runId,
+          });
+
+          // ── 5) Attach both log IDs to the trade row ──────────────────────
+          if (result.tradeId && (triggerLogId || executedLogId)) {
+            await broker.attachLogIds(result.tradeId, triggerLogId, executedLogId);
+          }
+
+          await refreshPositionRef();
+        },
+
+        log: async (msg: string) => broker.log("info", String(msg)),
+
+        takeProfitCheck: async (a: any): Promise<boolean> => {
+          const pct = Number((a as any)?.pct ?? a);
+          if (!Number.isFinite(pct) || pct <= 0) return false;
+          const pos = await broker.getPosition();
+          if (!pos) return false;
+          const markPrice  = broker.getMarkPricePublic();
+          if (!markPrice) return false;
+          const entryPrice = Number(pos.entry_price ?? 0);
+          if (!Number.isFinite(entryPrice) || entryPrice <= 0) return false;
+          const tpPrice = entryPrice * (1 + pct / 100);
+          if (markPrice >= tpPrice) {
+            if (advancedLogging) {
+              await broker.log("info",
+                `TAKE_PROFIT triggered: price ${markPrice.toFixed(6)} >= TP level ${tpPrice.toFixed(6)} (entry ${entryPrice.toFixed(6)} +${pct}%)`,
+                { trigger: "take_profit", pct, mark_price: markPrice, tp_price: tpPrice, entry_price: entryPrice }
+              );
+            }
+            // Use HP.sell so trigger/executed logs are created here too
+            await HP.sell(100);
+            return true;
+          }
+          return false;
+        },
+
+        stopLossCheck: async (a: any): Promise<boolean> => {
+          const pct = Number((a as any)?.pct ?? a);
+          if (!Number.isFinite(pct) || pct <= 0) return false;
+          const pos = await broker.getPosition();
+          if (!pos) return false;
+          const markPrice  = broker.getMarkPricePublic();
+          if (!markPrice) return false;
+          const entryPrice = Number(pos.entry_price ?? 0);
+          if (!Number.isFinite(entryPrice) || entryPrice <= 0) return false;
+          const slPrice = entryPrice * (1 - pct / 100);
+          if (markPrice <= slPrice) {
+            if (advancedLogging) {
+              await broker.log("info",
+                `STOP_LOSS triggered: price ${markPrice.toFixed(6)} <= SL level ${slPrice.toFixed(6)} (entry ${entryPrice.toFixed(6)} -${pct}%)`,
+                { trigger: "stop_loss", pct, mark_price: markPrice, sl_price: slPrice, entry_price: entryPrice }
+              );
+            }
+            await HP.sell(100);
+            return true;
+          }
+          return false;
+        },
+      };
+
+      // ── Run the strategy ─────────────────────────────────────────────────
+
       try {
         await runInSandbox(
           freshJs,
@@ -694,7 +896,7 @@ async function runProject(p: Project) {
   }
 }
 
-// ─── Tick + main (unchanged from original) ────────────────────────────────────
+// ─── Tick + main ──────────────────────────────────────────────────────────────
 
 async function tick() {
   klineCache.clear();
@@ -705,22 +907,20 @@ async function tick() {
     return;
   }
 
-  const projects        = (data ?? []) as Project[];
+  const projects         = (data ?? []) as Project[];
   const activeProjectIds = new Set(projects.map((p) => p.id));
 
   for (const p of projects) {
     try {
       await runProject(p);
     } catch (e: any) {
-      console.error(`[tick] runProject threw outside its own try/catch (project ${p.id}):`, e?.message ?? e);
+      console.error(`[tick] runProject threw (project ${p.id}):`, e?.message ?? e);
     }
   }
 
   for (const key of crossPrev.keys()) {
     const projectId = key.split("|")[0];
-    if (projectId && !activeProjectIds.has(projectId)) {
-      crossPrev.delete(key);
-    }
+    if (projectId && !activeProjectIds.has(projectId)) crossPrev.delete(key);
   }
 }
 
@@ -758,17 +958,14 @@ async function main() {
     },
   };
 
-  const VALID_INTERVALS = new Set<string>(["1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d"]);
-  const BASE_INTERVALS: string[] = ["1m"];
-  const forcedIntervals = (process.env.KLINE_INTERVALS ?? "").split(",").map((s) => s.trim()).filter((s) => VALID_INTERVALS.has(s));
+  const VALID_INTERVALS  = new Set<string>(["1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d"]);
+  const BASE_INTERVALS   = ["1m"];
+  const forcedIntervals  = (process.env.KLINE_INTERVALS ?? "").split(",").map((s) => s.trim()).filter((s) => VALID_INTERVALS.has(s));
 
   async function getActiveTimeframes(): Promise<string[]> {
     const statuses = (process.env.ACTIVE_PROJECT_STATUSES ?? "live,running").split(",").map((s) => s.trim()).filter(Boolean);
     const { data, error } = await supabase.from("projects").select("generated_js").in("status", statuses);
-    if (error) {
-      console.error("[KLINES] Could not query active project timeframes:", error.message);
-      return [];
-    }
+    if (error) { console.error("[KLINES] Could not query active project timeframes:", error.message); return []; }
     const found = new Set<string>();
     for (const row of data ?? []) {
       const js = String((row as any).generated_js ?? "").trim();
@@ -793,33 +990,21 @@ async function main() {
   }
 
   ensureManagers([...BASE_INTERVALS, ...forcedIntervals]);
+  try { ensureManagers(await getActiveTimeframes()); }
+  catch (e: any) { console.error("[KLINES] Initial timeframe discovery failed:", e?.message ?? e); }
 
-  try {
-    ensureManagers(await getActiveTimeframes());
-  } catch (e: any) {
-    console.error("[KLINES] Initial timeframe discovery failed:", e?.message ?? e);
-  }
-
-  const tfRefreshMs   = Math.max(60_000, Number(process.env.KLINE_TF_REFRESH_SECONDS ?? 300) * 1000);
-  let lastTfRefresh   = Date.now();
+  const tfRefreshMs = Math.max(60_000, Number(process.env.KLINE_TF_REFRESH_SECONDS ?? 300) * 1000);
+  let lastTfRefresh = Date.now();
 
   while (true) {
     await tick();
-
     if (Date.now() - lastTfRefresh >= tfRefreshMs) {
       lastTfRefresh = Date.now();
-      try {
-        ensureManagers(await getActiveTimeframes());
-      } catch (e: any) {
-        console.error("[KLINES] Timeframe refresh failed:", e?.message ?? e);
-      }
+      try { ensureManagers(await getActiveTimeframes()); }
+      catch (e: any) { console.error("[KLINES] Timeframe refresh failed:", e?.message ?? e); }
     }
-
     await new Promise((r) => setTimeout(r, 2000));
   }
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main().catch((e) => { console.error(e); process.exit(1); });
