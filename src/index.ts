@@ -251,7 +251,7 @@ async function insertTriggerLog(opts: {
   conditionRows:   ConditionRow[];  // exact conditions evaluated, in evaluation order
 }): Promise<string | null> {
   const { projectId, ownerId, side, symbol, interval, priceAtTrigger, positionBefore, runId, conditionRows } = opts;
-  const primaryReason = side === "BUY" ? "Strategy BUY signal" : "Strategy SELL signal";
+  const primaryReason = side === "BUY" ? "BUY signal detected" : "SELL signal detected";
 
   const detail_json: Record<string, any> = {
     kind:             "trade_trigger",
@@ -282,7 +282,7 @@ async function insertTriggerLog(opts: {
     projectId,
     ownerId,
     "info",
-    `TRADE_TRIGGER ${side} ${symbol} (${primaryReason})`,
+    `Result: ${primaryReason}`,
     { run_id: runId, symbol, exchange: "binance" },
     detail_json,
   );
@@ -330,12 +330,11 @@ async function insertExecutedLog(opts: {
     ...(result.skipReason ? { error: { reason: result.skipReason } } : {}),
   };
 
-  const statusLabel = result.status === "SUCCESS" ? "filled" : result.status.toLowerCase();
   return log(
     projectId,
     ownerId,
     "info",
-    `TRADE_EXECUTED ${side} ${symbol} (${statusLabel})`,
+    `Trade executed: ${side} ${symbol}`,
     { run_id: runId, symbol, exchange: "binance" },
     detail_json,
   );
@@ -712,28 +711,7 @@ async function runProject(p: Project) {
         return (strict ? prev.a > prev.b : prev.a >= prev.b) && currA < currB;
       };
 
-      if (advancedLogging) {
-        try {
-          const markPrice = broker.getMarkPricePublic();
-          const meta: Record<string, any> = {
-            run_id:      runId,
-            symbol,
-            mark_price:  markPrice,
-            in_position: Boolean(positionRef.current?.id),
-          };
-          if (positionRef.current) {
-            meta.entry_price = Number(positionRef.current.entry_price ?? 0);
-            meta.entry_time  = positionRef.current.entry_time;
-            const ep = Number(positionRef.current.entry_price ?? 0);
-            if (markPrice && Number.isFinite(ep) && ep > 0) {
-              meta.unrealized_pnl_pct = ((markPrice - ep) / ep * 100).toFixed(3) + "%";
-            }
-          }
-          await log(p.id, p.owner_id, "info", `[ADV] Tick for ${symbol}`, meta);
-        } catch {
-          // Never fail the strategy run due to advanced logging errors.
-        }
-      }
+
 
       // ── HP surface ────────────────────────────────────────────────────────
       //
@@ -746,6 +724,8 @@ async function runProject(p: Project) {
       //     - broker.getMarkPricePublic()  — last close from the kline cache
       //     - positionRef.current          — last DB read of the open position
       //   Both are captured synchronously before any async work begins.
+
+      let tradeActionTaken = false;
 
       const HP = {
         // ── HP.__cond ──────────────────────────────────────────────────────────
@@ -863,6 +843,7 @@ async function runProject(p: Project) {
 
         buy: async (a: any, b?: any) => {
           const usd = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.usd ?? 0);
+          tradeActionTaken = true;
 
           // ── 1) Capture trigger snapshot synchronously at decision-time ───
           const priceAtTrigger = broker.getMarkPricePublic() ?? 0;
@@ -917,6 +898,7 @@ async function runProject(p: Project) {
 
         sell: async (a: any, b?: any) => {
           const pct = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.pct ?? 100);
+          tradeActionTaken = true;
 
           // ── 1) Capture trigger snapshot synchronously at decision-time ───
           const priceAtTrigger = broker.getMarkPricePublic() ?? 0;
@@ -1041,6 +1023,12 @@ async function runProject(p: Project) {
         symbolFailures++;
         await log(p.id, p.owner_id, "error",
           `Strategy error for ${symbol}: ${e?.message ?? String(e)}`,
+          { run_id: runId, symbol, exchange: "binance" }
+        );
+      }
+
+      if (!tradeActionTaken) {
+        await log(p.id, p.owner_id, "info", "Result: No trade conditions met",
           { run_id: runId, symbol, exchange: "binance" }
         );
       }

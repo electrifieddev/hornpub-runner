@@ -232,9 +232,6 @@ export class PaperBroker {
 
       positionAfter = { qty: totalQty, entry_price: avgEntry, position_id: existing.id };
 
-      await this.log("info", "BUY executed (paper, added to position)", {
-        usd, price, new_qty: newQty, total_qty: totalQty, avg_entry: avgEntry, position_id: existing.id,
-      });
 
     } else {
       const { data, error } = await this.sb
@@ -277,9 +274,6 @@ export class PaperBroker {
                 meta: { usd, reason: "strategy", kind: "add_to_position_race_merge", avg_entry: avgEntry },
               });
               positionAfter = { qty: totalQty, entry_price: avgEntry, position_id: racePos.id };
-              await this.log("info", "BUY executed (paper, merged into race-concurrent position)", {
-                usd, price, new_qty: newQty, total_qty: totalQty, avg_entry: avgEntry, position_id: racePos.id,
-              });
               return { tradeId, fillPrice: price, filledQty: newQty, fee: 0, feeAsset: "USDT", status: "SUCCESS", orderId: null, positionAfter };
             }
           }
@@ -299,7 +293,6 @@ export class PaperBroker {
 
       positionAfter = { qty: newQty, entry_price: price, position_id: positionId };
 
-      await this.log("info", "BUY executed (paper, new position)", { usd, price, qty: newQty });
     }
 
     return { tradeId, fillPrice: price, filledQty: newQty, fee: 0, feeAsset: "USDT", status: "SUCCESS", orderId: null, positionAfter };
@@ -349,7 +342,7 @@ export class PaperBroker {
     if (remainingQty <= 1e-12) {
       const { error } = await this.sb
         .from("project_positions")
-        .update({ status: "closed", exit_price: price, exit_time: now, realized_pnl: realized })
+        .delete()
         .eq("id", pos.id);
       if (error) throw error;
 
@@ -357,14 +350,10 @@ export class PaperBroker {
         side: "sell", qty: closeQty, price,
         realizedPnl: realized, fee: 0, ts: now,
         positionId: pos.id,
-        meta: { pct, kind: "close", reason: "strategy" },
+        meta: { pct, kind: "close", reason: "strategy", exit_price: price, exit_time: now, realized_pnl: realized },
       });
 
       positionAfter = { qty: 0, status: "closed", exit_price: price, position_id: pos.id };
-
-      await this.log("info", "SELL executed (paper, close)", {
-        pct, price, qty_closed: closeQty, realized_pnl: realized, position_id: pos.id,
-      });
     } else {
       const prevRealized = Number(pos.realized_pnl ?? 0) || 0;
       const { error } = await this.sb
@@ -381,10 +370,6 @@ export class PaperBroker {
       });
 
       positionAfter = { qty: remainingQty, entry_price: entryPrice, position_id: pos.id };
-
-      await this.log("info", "SELL executed (paper, partial)", {
-        pct, price, qty_closed: closeQty, qty_remaining: remainingQty, realized_pnl_add: realized, position_id: pos.id,
-      });
     }
 
     return { tradeId, fillPrice: price, filledQty: closeQty, fee: 0, feeAsset: "USDT", status: "SUCCESS", orderId: null, positionAfter };

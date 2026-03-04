@@ -431,10 +431,6 @@ export class LiveBroker {
       });
 
       positionAfter = { qty: totalQtyMerged, entry_price: avgEntry, position_id: existing.id };
-      await this.log("info", "BUY executed (live, added to position)", {
-        usd, fill_price: fillPrice, qty: effectiveQty, total_qty: totalQtyMerged,
-        avg_entry: avgEntry, fee: totalFee, fee_asset: feeAsset, order_id: order.orderId, position_id: existing.id,
-      });
 
     } else {
       const { data, error } = await this.sb
@@ -486,9 +482,6 @@ export class LiveBroker {
       });
 
       positionAfter = { qty: effectiveQty, entry_price: fillPrice, position_id: positionId };
-      await this.log("info", "BUY executed (live, new position)", {
-        usd, fill_price: fillPrice, qty: effectiveQty, fee: totalFee, fee_asset: feeAsset, order_id: order.orderId,
-      });
     }
 
     return { tradeId, fillPrice, filledQty: effectiveQty, fee: feeUsd, feeAsset, status: tradeStatus, orderId, positionAfter };
@@ -565,21 +558,17 @@ export class LiveBroker {
     if (remainingQty <= 1e-8) {
       const { error } = await this.sb
         .from("project_positions")
-        .update({ status: "closed", exit_price: fillPrice, exit_time: now, realized_pnl: prevRealized + realized })
+        .delete()
         .eq("id", pos.id);
       if (error) throw error;
 
       tradeId = await this.insertTrade({
         side: "sell", qty: filledQty, price: fillPrice, realizedPnl: realized,
         fee: feeUsd, feeAsset, ts: now, positionId: pos.id, orderId: order.orderId,
-        meta: { pct, kind: "close", reason: "strategy", gross_pnl: grossPnl, raw_fee: totalFee, binance_status: order.status },
+        meta: { pct, kind: "close", reason: "strategy", gross_pnl: grossPnl, raw_fee: totalFee, binance_status: order.status, exit_price: fillPrice, exit_time: now, realized_pnl: prevRealized + realized },
       });
 
       positionAfter = { qty: 0, status: "closed", exit_price: fillPrice, position_id: pos.id };
-      await this.log("info", "SELL executed (live, close)", {
-        pct, fill_price: fillPrice, qty_closed: filledQty, gross_pnl: grossPnl,
-        fee: totalFee, fee_asset: feeAsset, realized_pnl: realized, order_id: order.orderId, position_id: pos.id,
-      });
 
     } else {
       const { error } = await this.sb
@@ -595,11 +584,6 @@ export class LiveBroker {
       });
 
       positionAfter = { qty: remainingQty, entry_price: entryPrice, position_id: pos.id };
-      await this.log("info", "SELL executed (live, partial)", {
-        pct, fill_price: fillPrice, qty_closed: filledQty, qty_remaining: remainingQty,
-        gross_pnl: grossPnl, fee: totalFee, fee_asset: feeAsset, realized_pnl_add: realized,
-        order_id: order.orderId, position_id: pos.id,
-      });
     }
 
     return { tradeId, fillPrice, filledQty, fee: feeUsd, feeAsset, status: tradeStatus, orderId, positionAfter };
