@@ -45,10 +45,14 @@ type ProjectSettings = {
  * Stored as detail_json.trigger.rows — an ordered array so there are no key collisions.
  */
 type ConditionRow = {
-  condition: string;  // human label, e.g. "RSI(14)"
-  value:     string;  // actual value(s) at decision time, e.g. "27.84" or "61180 > 61050"
-  rule:      string;  // exact comparison as configured, e.g. "RSI(14) < 30"
-  result:    boolean; // true = condition passed
+  condition:    string;   // human label, e.g. "RSI(14)" or "AND" / "OR"
+  value:        string;   // actual value at decision time, e.g. "27.84"
+  rule:         string;   // exact comparison, e.g. "RSI(14) < 30", or "—" for context rows
+  result:       boolean | null;
+  // null         → context row (RHS value display only, never flipped)
+  // true/false   → actual runtime boolean — always the real evaluated result
+  grouped?:     boolean;  // true = sub-condition inside an AND/OR group; __flipFrom skips it
+  groupSummary?: "AND" | "OR"; // present on group summary rows; __flipFrom skips these too
 };
 
 function isWithinTradeHours(hours: TradeHours | undefined): boolean {
@@ -761,6 +765,100 @@ async function runProject(p: Project) {
             result: Boolean(result),
           });
           return Boolean(result);
+        },
+
+        // ── HP.__ctx ───────────────────────────────────────────────────────────
+        // Appends a context-only row (rule = "—", result = null) used to show the
+        // RHS indicator value when two indicators are compared, e.g. EMA(21) = 61050.
+        // These rows are display-only — __flipFrom skips them.
+        __ctx: (condition: string, value: any): void => {
+          conditionRows.push({
+            condition,
+            value:  String(value ?? ""),
+            rule:   "—",
+            result: null as any,
+          });
+        },
+
+        // ── HP.__group ─────────────────────────────────────────────────────────
+        // Called by the logic_operation (AND/OR) override. Evaluates the compound
+        // thunk, marks all rows emitted during evaluation as `grouped: true`, then
+        // appends a group summary row storing the ACTUAL runtime boolean result.
+        //
+        // Group summary rows are NEVER flipped by __flipFrom — they are runtime
+        // facts ("this AND evaluated to false") not judgments. This is correct even
+        // in nested AND/OR inside else branches: the inner summary always reflects
+        // what actually happened at runtime.
+        //
+        // Individual sub-rows: also never flipped (grouped: true). Their results
+        // are always their real runtime values.
+        __group: (op: "AND" | "OR", startIdx: number, evaluate: () => boolean): boolean => {
+          const result = Boolean(evaluate());
+          for (let i = startIdx; i < conditionRows.length; i++) {
+            conditionRows[i]!.grouped = true;
+          }
+          conditionRows.push({
+            condition:    op,
+            value:        String(result),   // "true" or "false" — the raw runtime fact
+            rule:         "—",
+            result:       result,           // actual boolean, never inverted
+            groupSummary: op,
+          });
+          return result;
+        },
+
+        // ── HP.__checkpoint ────────────────────────────────────────────────────
+        // Returns the current length of conditionRows — used by the controls_if
+        // override to mark "where we were before this condition was evaluated".
+        __checkpoint: (): number => {
+          return conditionRows.length;
+        },
+
+        // ── HP.__flipFrom ──────────────────────────────────────────────────────
+        // Called by the controls_if override when an else/else-if branch is taken.
+        // Inverts the result and operator of leaf condition rows recorded since `idx`
+        // so the log accurately reflects "why this branch was entered".
+        //
+        // Skipped rows (never mutated):
+        //   - result === null   → context rows (RHS display only)
+        //   - grouped === true  → sub-conditions inside AND/OR groups (always accurate)
+        //   - groupSummary set  → AND/OR summary rows (runtime facts, never inverted)
+        //
+        // Only plain leaf boolean comparisons are flipped.
+        __flipFrom: (idx: number): void => {
+          const OPS: [string, string][] = [
+            [" >= ", " < "], [" <= ", " > "],
+            [" > ",  " <= "], [" < ",  " >= "],
+            [" == ", " != "], [" != ", " == "],
+          ];
+          function invertOp(s: string): string {
+            for (const [op, inv] of OPS) {
+              if (s.includes(op)) return s.replace(op, inv);
+            }
+            return s;
+          }
+          for (let i = idx; i < conditionRows.length; i++) {
+            const row = conditionRows[i]!;
+            if (row.result === null) continue;       // context rows — display only
+            if (row.grouped)        continue;        // AND/OR sub-rows — always accurate
+            if (row.groupSummary)   continue;        // AND/OR summaries — runtime facts
+            row.result = !row.result;
+            row.rule   = invertOp(row.rule);
+          }
+        },
+
+        // ── HP.__negate ────────────────────────────────────────────────────────
+        // Called by the logic_negate override (NOT block). Flips the last recorded
+        // condition row's result and rule to reflect the negation, then returns !val.
+        __negate: (val: boolean): boolean => {
+          if (conditionRows.length > 0) {
+            const last = conditionRows[conditionRows.length - 1]!;
+            last.result = !last.result;
+            last.rule   = last.rule.startsWith("NOT (")
+              ? last.rule.slice(5, -1)       // double-NOT → unwrap
+              : `NOT (${last.rule})`;
+          }
+          return !val;
         },
 
         buy: async (a: any, b?: any) => {
