@@ -19,9 +19,8 @@
  */
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { KlineManager }       from "./klines/KlineManager.js";
-import { SupabaseKlineStore } from "./klines/SupabaseKlineStore.js";
-import { KlineCache }         from "./klines/KlineCache.js";
+import { KlineCache }              from "./klines/KlineCache.js";
+import { InMemoryKlineManager }    from "./klines/InMemoryKlineManager.js";
 import createIndicators       from "./indicators/createIndicators.js";
 import { runInSandbox }       from "./engine/Sandbox.js";
 import { PaperBroker }        from "./broker/PaperBroker.js";
@@ -100,7 +99,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 
 // ─── Global kline cache ───────────────────────────────────────────────────────
 
-const klineCache = new KlineCache({ supabase, table: "market_klines" });
+const klineCache = new KlineCache({ maxCandles: Number(process.env.INDICATOR_MAX_CANDLES ?? 5000) });
 const crossPrev  = new Map<string, { a: number; b: number }>();
 
 function safeNumber(v: any): number {
@@ -437,38 +436,30 @@ async function runProject(p: Project) {
 
     const timeframes = extractTimeframesFromCode(freshJs) ?? ["1m"];
     const primaryTf  = timeframes[0] ?? "1m";
-    // Always include 1m so the broker always has a fresh mark price,
-    // regardless of the strategy timeframe (e.g. 15m strategy would otherwise
-    // use a 15-minute-old candle close as the execution price).
-    const preloadTfs = timeframes.includes("1m") ? timeframes : [...timeframes, "1m"];
 
     for (const symbol of symbols) {
       symbolTotal++;
 
-      let primaryPreloadOk = true;
-      for (const tf of preloadTfs) {
-        const isPrimary = tf === primaryTf;
-        try {
-          await klineCache.preload("binance", symbol, tf, {
-            maxCandles: Number(process.env.INDICATOR_MAX_CANDLES ?? 5000),
-          });
-        } catch (e: any) {
-          const msg = e?.message ?? String(e);
-          if (isPrimary) {
-            primaryPreloadOk = false;
-            await log(p.id, p.owner_id, "warn",
-              `Primary klines unavailable for ${symbol} ${tf} — skipping symbol: ${msg}`,
-              { run_id: runId, symbol, tf, exchange: "binance" }
-            );
-          } else {
-            await log(p.id, p.owner_id, "warn",
-              `Secondary klines unavailable for ${symbol} ${tf} — indicators for this tf will return NaN: ${msg}`,
-              { run_id: runId, symbol, tf, exchange: "binance" }
-            );
-          }
-        }
+      // Check that the primary timeframe klines are ready in memory.
+      // InMemoryKlineManager bootstraps in the background — if not ready yet, skip and retry next run.
+      if (!klineCache.isReady("binance", symbol, primaryTf)) {
+        await log(p.id, p.owner_id, "info",
+          `Klines not ready yet for ${symbol} ${primaryTf} — skipping until bootstrapped`,
+          { run_id: runId, symbol, tf: primaryTf, exchange: "binance" }
+        );
+        continue;
       }
-      if (!primaryPreloadOk) continue;
+
+      // Staleness guard: skip if latest candle is too old (KlineManager may be lagging)
+      const staleThresholdMs = 3 * 60 * 1000; // 3 minutes
+      const ageMs = klineCache.ageMs("binance", symbol, "1m");
+      if (ageMs > staleThresholdMs) {
+        await log(p.id, p.owner_id, "warn",
+          `Stale klines for ${symbol} (${Math.round(ageMs / 60_000)}m old) — skipping`,
+          { run_id: runId, symbol, exchange: "binance" }
+        );
+        continue;
+      }
 
       const maxTrades = settings.max_trades_per_day;
       let todayCount = 0;
@@ -1066,8 +1057,6 @@ async function runProject(p: Project) {
 // ─── Tick + main ──────────────────────────────────────────────────────────────
 
 async function tick() {
-  klineCache.clear();
-
   const { data, error } = await supabase.rpc("claim_due_projects", { p_limit: 5 });
   if (error) {
     console.error("claim_due_projects error:", error.message);
@@ -1094,7 +1083,7 @@ async function tick() {
 async function main() {
   console.log("Hornpub runner started.");
 
-  const klineStore = new SupabaseKlineStore(supabase);
+  const VALID_INTERVALS = new Set<string>(["1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d"]);
 
   const pollEverySeconds = (() => {
     if (process.env.KLINE_REFRESH_EVERY_SECONDS !== undefined) {
@@ -1103,73 +1092,49 @@ async function main() {
     return Math.max(10, Math.floor(Number(process.env.KLINE_REFRESH_EVERY_MS ?? 60_000) / 1000));
   })();
 
-  const klineManagerOpts = {
-    store: klineStore,
-    exchange: "binance" as const,
-    historyDays:    Number(process.env.KLINE_RETENTION_DAYS ?? 30),
+  // Single shared in-memory kline manager — no database involved.
+  // Fetches directly from Binance, writes into the shared KlineCache.
+  // All projects read from the same cache instance.
+  const klineManager = new InMemoryKlineManager({
+    cache:            klineCache,
+    exchange:         "binance",
+    historyDays:      Number(process.env.KLINE_RETENTION_DAYS ?? 30),
     pollEverySeconds,
-    maxConcurrency: Number(process.env.KLINE_MAX_CONCURRENCY ?? 3),
-    getActiveSymbols: async () => {
+    maxConcurrency:   Number(process.env.KLINE_MAX_CONCURRENCY ?? 3),
+    getActive: async () => {
       const statuses = (process.env.ACTIVE_PROJECT_STATUSES ?? "live,running").split(",").map((s) => s.trim()).filter(Boolean);
-      const { data, error } = await supabase.from("projects").select("symbols,status").in("status", statuses);
+      const { data, error } = await supabase.from("projects").select("symbols, generated_js").in("status", statuses);
       if (error) throw error;
-      const syms: string[] = [];
+
+      const symbols  = new Set<string>();
+      const intervals = new Set<string>();
+
       for (const row of data ?? []) {
-        if (Array.isArray((row as any).symbols)) syms.push(...((row as any).symbols as string[]));
+        if (Array.isArray((row as any).symbols)) {
+          for (const s of (row as any).symbols as string[]) {
+            if (s) symbols.add(s.trim().toUpperCase());
+          }
+        }
+        const js = String((row as any).generated_js ?? "").trim();
+        if (js) {
+          for (const tf of extractTimeframesFromCode(js)) {
+            if (VALID_INTERVALS.has(tf)) intervals.add(tf);
+          }
+        }
       }
-      return syms;
+
+      return { symbols: [...symbols], intervals: [...intervals] };
     },
     logger: (msg: string, extra?: any) => {
       if (extra !== undefined) console.log(`[KLINES] ${msg}`, extra);
       else console.log(`[KLINES] ${msg}`);
     },
-  };
+  });
 
-  const VALID_INTERVALS  = new Set<string>(["1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d"]);
-  const BASE_INTERVALS   = ["1m"];
-  const forcedIntervals  = (process.env.KLINE_INTERVALS ?? "").split(",").map((s) => s.trim()).filter((s) => VALID_INTERVALS.has(s));
-
-  async function getActiveTimeframes(): Promise<string[]> {
-    const statuses = (process.env.ACTIVE_PROJECT_STATUSES ?? "live,running").split(",").map((s) => s.trim()).filter(Boolean);
-    const { data, error } = await supabase.from("projects").select("generated_js").in("status", statuses);
-    if (error) { console.error("[KLINES] Could not query active project timeframes:", error.message); return []; }
-    const found = new Set<string>();
-    for (const row of data ?? []) {
-      const js = String((row as any).generated_js ?? "").trim();
-      if (!js) continue;
-      for (const tf of extractTimeframesFromCode(js)) {
-        if (VALID_INTERVALS.has(tf)) found.add(tf);
-      }
-    }
-    return [...found];
-  }
-
-  const runningManagers = new Map<string, KlineManager>();
-
-  function ensureManagers(intervals: string[]) {
-    for (const interval of intervals) {
-      if (runningManagers.has(interval)) continue;
-      console.log(`[KLINES] Starting KlineManager for interval: ${interval}`);
-      const m = new KlineManager({ ...klineManagerOpts, interval: interval as any });
-      runningManagers.set(interval, m);
-      m.start().catch((e) => console.error(`[KLINES] KlineManager(${interval}) threw unexpectedly:`, e));
-    }
-  }
-
-  ensureManagers([...BASE_INTERVALS, ...forcedIntervals]);
-  try { ensureManagers(await getActiveTimeframes()); }
-  catch (e: any) { console.error("[KLINES] Initial timeframe discovery failed:", e?.message ?? e); }
-
-  const tfRefreshMs = Math.max(60_000, Number(process.env.KLINE_TF_REFRESH_SECONDS ?? 300) * 1000);
-  let lastTfRefresh = Date.now();
+  klineManager.start().catch((e) => console.error("[KLINES] InMemoryKlineManager threw unexpectedly:", e));
 
   while (true) {
     await tick();
-    if (Date.now() - lastTfRefresh >= tfRefreshMs) {
-      lastTfRefresh = Date.now();
-      try { ensureManagers(await getActiveTimeframes()); }
-      catch (e: any) { console.error("[KLINES] Timeframe refresh failed:", e?.message ?? e); }
-    }
     await new Promise((r) => setTimeout(r, 2000));
   }
 }
