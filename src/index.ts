@@ -40,6 +40,17 @@ type ProjectSettings = {
   advanced_logging?:   boolean;
 };
 
+/**
+ * One row in the trigger condition table.
+ * Stored as detail_json.trigger.rows — an ordered array so there are no key collisions.
+ */
+type ConditionRow = {
+  condition: string;  // human label, e.g. "RSI(14)"
+  value:     string;  // actual value(s) at decision time, e.g. "27.84" or "61180 > 61050"
+  rule:      string;  // exact comparison as configured, e.g. "RSI(14) < 30"
+  result:    boolean; // true = condition passed
+};
+
 function isWithinTradeHours(hours: TradeHours | undefined): boolean {
   if (!hours?.start || !hours?.end) return true;
   const now  = new Date();
@@ -233,8 +244,9 @@ async function insertTriggerLog(opts: {
   priceAtTrigger:  number;
   positionBefore:  Record<string, any> | null;
   runId:           string;
+  conditionRows:   ConditionRow[];  // exact conditions evaluated, in evaluation order
 }): Promise<string | null> {
-  const { projectId, ownerId, side, symbol, interval, priceAtTrigger, positionBefore, runId } = opts;
+  const { projectId, ownerId, side, symbol, interval, priceAtTrigger, positionBefore, runId, conditionRows } = opts;
   const primaryReason = side === "BUY" ? "Strategy BUY signal" : "Strategy SELL signal";
 
   const detail_json: Record<string, any> = {
@@ -245,8 +257,10 @@ async function insertTriggerLog(opts: {
     price_at_trigger: priceAtTrigger,
     trigger: {
       primary_reason: primaryReason,
-      // conditions array: strategies may extend this in future; empty for generic strategies
-      conditions: [],
+      // rows: ordered array of every condition evaluated at decision time.
+      // Each entry is { condition, value, rule, result } — truthful because rule strings
+      // are co-generated with the actual indicator call by the same Blockly forBlock function.
+      rows: conditionRows,
       context: {
         position_before: positionBefore
           ? {
@@ -450,8 +464,9 @@ async function runProject(p: Project) {
       if (!primaryPreloadOk) continue;
 
       const maxTrades = settings.max_trades_per_day;
+      let todayCount = 0;
       if (maxTrades !== undefined && Number.isFinite(maxTrades) && maxTrades > 0) {
-        const todayCount = await countTradesToday(supabase, p.id, symbol);
+        todayCount = await countTradesToday(supabase, p.id, symbol);
         if (todayCount >= maxTrades) {
           if (advancedLogging) {
             await log(p.id, p.owner_id, "info",
@@ -465,6 +480,38 @@ async function runProject(p: Project) {
 
       const context    = { exchange: "binance", symbol, projectId: p.id };
       const indicators = createIndicators(klineCache, context);
+
+      // ── Per-tick condition tracker ────────────────────────────────────────
+      // Populated in two phases:
+      //   1) System conditions (trade hours, max trades) — added here, before sandbox
+      //   2) User strategy conditions — added by HP.__cond inside the sandbox
+      // HP.buy/sell takes a snapshot when called, so successive calls in one tick
+      // each get only the conditions accumulated up to that point.
+      const conditionRows: ConditionRow[] = [];
+
+      // System condition: active trade window
+      if (settings.trade_hours?.start && settings.trade_hours?.end) {
+        const now     = new Date();
+        const hh      = String(now.getUTCHours()).padStart(2, "0");
+        const mm      = String(now.getUTCMinutes()).padStart(2, "0");
+        conditionRows.push({
+          condition: "Active Window (UTC)",
+          value:     `${hh}:${mm}`,
+          rule:      `within ${settings.trade_hours.start}–${settings.trade_hours.end}`,
+          result:    true, // must be true: we would have returned early otherwise
+        });
+      }
+
+      // System condition: max daily trades (only log if the limit is configured)
+      if (maxTrades !== undefined && Number.isFinite(maxTrades) && maxTrades > 0) {
+        // todayCount was already fetched above for the guard — reuse it
+        conditionRows.push({
+          condition: "Max Trades Today",
+          value:     String(todayCount),
+          rule:      `< ${maxTrades}`,
+          result:    true, // must be true: we would have `continue`d otherwise
+        });
+      }
 
       const brokerCtxBase = {
         userId:    p.owner_id,
@@ -697,6 +744,25 @@ async function runProject(p: Project) {
       //   Both are captured synchronously before any async work begins.
 
       const HP = {
+        // ── HP.__cond ──────────────────────────────────────────────────────────
+        // Called by Blockly-generated strategy code for every boolean condition.
+        // The rule string is co-generated with the actual indicator call in the same
+        // Blockly forBlock function — same field values, same function. They cannot diverge.
+        //
+        // Usage in generated JS (emitted by BlocklyEditor forBlock generators):
+        //   ((_v) => HP.__cond("RSI(14)", String(+_v.toFixed(2)), "RSI(14) < 30", _v < 30))(RSI({period:14}))
+        //
+        // Returns the boolean `result` unchanged so it can be used in `if` expressions.
+        __cond: (condition: string, value: any, rule: string, result: boolean): boolean => {
+          conditionRows.push({
+            condition,
+            value:  String(value ?? ""),
+            rule,
+            result: Boolean(result),
+          });
+          return Boolean(result);
+        },
+
         buy: async (a: any, b?: any) => {
           const usd = typeof a === "number" ? a : typeof b === "number" ? b : Number(a?.usd ?? 0);
 
@@ -705,6 +771,11 @@ async function runProject(p: Project) {
           const positionBefore = positionRef.current
             ? { ...positionRef.current }   // shallow copy; sufficient for snapshot
             : null;
+
+          // Snapshot condition rows accumulated up to this moment, then reset
+          // so that a second HP.buy in the same tick gets a fresh slate.
+          const conditionRowsSnapshot = [...conditionRows];
+          conditionRows.length = 0;
 
           // ── 2) Insert TRADE_TRIGGER log ──────────────────────────────────
           const triggerLogId = await insertTriggerLog({
@@ -716,6 +787,7 @@ async function runProject(p: Project) {
             priceAtTrigger,
             positionBefore,
             runId,
+            conditionRows: conditionRowsSnapshot,
           });
 
           // ── 3) Execute the order ─────────────────────────────────────────
@@ -755,6 +827,10 @@ async function runProject(p: Project) {
             : null;
           const posQty = Number(positionRef.current?.qty ?? 0);
 
+          // Snapshot and reset condition rows
+          const conditionRowsSnapshot = [...conditionRows];
+          conditionRows.length = 0;
+
           // ── 2) Insert TRADE_TRIGGER log ──────────────────────────────────
           const triggerLogId = await insertTriggerLog({
             projectId:    p.id,
@@ -765,6 +841,7 @@ async function runProject(p: Project) {
             priceAtTrigger,
             positionBefore,
             runId,
+            conditionRows: conditionRowsSnapshot,
           });
 
           // ── 3) Execute the order ─────────────────────────────────────────
