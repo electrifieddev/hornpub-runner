@@ -340,18 +340,18 @@ export class PaperBroker {
     let positionAfter: Record<string, any> | null = null;
 
     if (remainingQty <= 1e-12) {
-      const { error } = await this.sb
-        .from("project_positions")
-        .delete()
-        .eq("id", pos.id);
-      if (error) throw error;
-
       tradeId = await this.insertTrade({
         side: "sell", qty: closeQty, price,
         realizedPnl: realized, fee: 0, ts: now,
         positionId: pos.id,
         meta: { pct, kind: "close", reason: "strategy", exit_price: price, exit_time: now, realized_pnl: realized },
       });
+
+      const { error } = await this.sb
+        .from("project_positions")
+        .delete()
+        .eq("id", pos.id);
+      if (error) throw error;
 
       positionAfter = { qty: 0, status: "closed", exit_price: price, position_id: pos.id };
     } else {

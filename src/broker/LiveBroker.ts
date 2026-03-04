@@ -556,17 +556,17 @@ export class LiveBroker {
     let positionAfter: Record<string, any> | null = null;
 
     if (remainingQty <= 1e-8) {
-      const { error } = await this.sb
-        .from("project_positions")
-        .delete()
-        .eq("id", pos.id);
-      if (error) throw error;
-
       tradeId = await this.insertTrade({
         side: "sell", qty: filledQty, price: fillPrice, realizedPnl: realized,
         fee: feeUsd, feeAsset, ts: now, positionId: pos.id, orderId: order.orderId,
         meta: { pct, kind: "close", reason: "strategy", gross_pnl: grossPnl, raw_fee: totalFee, binance_status: order.status, exit_price: fillPrice, exit_time: now, realized_pnl: prevRealized + realized },
       });
+
+      const { error } = await this.sb
+        .from("project_positions")
+        .delete()
+        .eq("id", pos.id);
+      if (error) throw error;
 
       positionAfter = { qty: 0, status: "closed", exit_price: fillPrice, position_id: pos.id };
 
