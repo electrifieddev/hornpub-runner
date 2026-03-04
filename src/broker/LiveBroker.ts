@@ -145,7 +145,7 @@ export class LiveBroker {
   // ─── Price ────────────────────────────────────────────────────────────────
 
   private getMarkPrice(): number | null {
-    const candidates = [this.ctx.tf, "1m", "5m", "15m", "1h", "4h"];
+    const candidates = ["1m", "3m", "5m", "15m", this.ctx.tf, "1h", "4h"];
     for (const tf of candidates) {
       const closes = this.cache.getCloses(this.ctx.exchange, this.ctx.symbol, tf);
       if (!closes || closes.length === 0) continue;
@@ -568,7 +568,7 @@ export class LiveBroker {
         .eq("id", pos.id);
       if (error) throw error;
 
-      positionAfter = { qty: 0, status: "closed", exit_price: fillPrice, position_id: pos.id };
+      positionAfter = { qty: 0, status: "closed", exit_price: fillPrice, position_id: pos.id, realized_pnl: prevRealized + realized };
 
     } else {
       const { error } = await this.sb

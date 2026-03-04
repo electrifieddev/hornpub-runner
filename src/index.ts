@@ -437,12 +437,16 @@ async function runProject(p: Project) {
 
     const timeframes = extractTimeframesFromCode(freshJs) ?? ["1m"];
     const primaryTf  = timeframes[0] ?? "1m";
+    // Always include 1m so the broker always has a fresh mark price,
+    // regardless of the strategy timeframe (e.g. 15m strategy would otherwise
+    // use a 15-minute-old candle close as the execution price).
+    const preloadTfs = timeframes.includes("1m") ? timeframes : [...timeframes, "1m"];
 
     for (const symbol of symbols) {
       symbolTotal++;
 
       let primaryPreloadOk = true;
-      for (const tf of timeframes) {
+      for (const tf of preloadTfs) {
         const isPrimary = tf === primaryTf;
         try {
           await klineCache.preload("binance", symbol, tf, {
